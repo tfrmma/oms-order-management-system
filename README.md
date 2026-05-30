@@ -6,23 +6,25 @@ The SOR was already fast (1–3 µs, zero heap, integer-only hot path). The OMS 
 
 ---
 
-## What's in here
+## Files
 
-```
-sor/
-├── types.hpp               integer price/qty types, constants, ChildOrder, SplitResult
-├── normalized_book.hpp     SoA order book, precomputed cumulative qty
-├── exchange_state.hpp      LatencyTracker (EWMA + vol/imbalance penalty), LotConstraints
-├── routing_engine.hpp/cpp  the SOR: K-way merge → greedy fill
+**SOR**
+- `types.hpp` — integer price/qty types, constants, `ChildOrder`, `SplitResult`
+- `normalized_book.hpp` — SoA order book, precomputed cumulative qty
+- `exchange_state.hpp` — `LatencyTracker` (EWMA + vol/imbalance penalty), `LotConstraints`
+- `routing_engine.hpp/cpp` — the SOR: K-way merge → greedy fill
 
-oms/
-├── oms_types.hpp           OMS types: signals, reports, enums, Result<T>
-├── order_pool.hpp          ParentOrder, ChildOrderState, OMSOrderPool (flat pre-alloc)
-├── position_tracker.hpp    InstrumentPosition (signed net), MarginState (async update)
-├── risk_engine.hpp         PreTradeRiskEngine: fat-finger, position limit, notional, margin
-├── spsc_queue.hpp          SPSC ring buffer, GatewayQueue/InboundQueue aliases, OutboundOrder
-├── execution_core.hpp/cpp  ExecutionCore: the main loop, lifecycle, rerouting
-```
+**OMS**
+- `oms_types.hpp` — signals, reports, enums, `Result<T>`
+- `order_pool.hpp` — `ParentOrder`, `ChildOrderState`, `OMSOrderPool` (flat pre-alloc)
+- `position_tracker.hpp` — `InstrumentPosition` (signed net), `MarginState` (async update)
+- `risk_engine.hpp` — `PreTradeRiskEngine`: fat-finger, position limit, notional, margin
+- `spsc_queue.hpp` — SPSC ring buffer, `GatewayQueue`/`InboundQueue` aliases, `OutboundOrder`
+- `execution_core.hpp/cpp` — `ExecutionCore`: main loop, order lifecycle, rerouting
+
+**Examples**
+- `main_example.cpp` — standalone SOR demo
+- `oms_example.cpp` — full OMS pipeline demo
 
 ---
 
@@ -58,7 +60,7 @@ StrategyOrderSignal  →  PreTradeRiskEngine  →  OMSOrderPool (alloc parent)
 
 Single execution thread, busy-spinning. Two inbound SPSC queues (strategy signals, execution reports). One outbound queue per exchange gateway thread.
 
-`OMSOrderPool` is ~2.8 MB (4096 parents × 128 B + 32768 children × 64 B). It lives on the heap or in `.bss` — never on the stack. O(1) alloc/free via LIFO free lists. Access by ID is a direct array index.
+`OMSOrderPool` is ~2.8 MB (4096 parents + 32768 children). It lives on the heap or in `.bss` — never on the stack. O(1) alloc/free via LIFO free lists. Access by ID is a direct array index.
 
 ---
 
@@ -90,7 +92,6 @@ make oms_example_san -j$(nproc)
 ## Using it
 
 ```cpp
-// build config once at startup
 ExecCoreConfig cfg{};
 cfg.fees             = fees;
 cfg.exchange_states  = states;   // your live book pointers
@@ -104,10 +105,9 @@ cfg.risk_limits.max_order_lots[BTC_PERP] = to_lots(10.0, 0.001);
 cfg.risk_limits.max_net_lots[BTC_PERP]   = to_lots(50.0, 0.001);
 cfg.risk_limits.max_notional_usd         = 500'000.0;
 
-// ExecutionCore is ~2.8 MB — don't put it on the stack
+// ~2.8 MB — don't put it on the stack
 auto core = std::make_unique<ExecutionCore>(cfg);
 
-// spin the execution thread
 std::thread exec_thread([&]{ core->run(); });
 
 // strategy pushes signals
@@ -129,9 +129,7 @@ rep.exec_type        = ExecType::FILL;
 core->exec_report_queue.push(rep);
 ```
 
-`limit_price_usd` is in USD. The OMS converts to ticks internally — strategies don't deal with tick arithmetic.
-
-If a child gets canceled or rejected, the OMS automatically computes the remaining `leaves_qty`, rebuilds the `RoutingContext`, and re-runs the SOR. No intervention needed.
+`limit_price_usd` is in USD. The OMS converts to ticks internally. If a child gets canceled or rejected, the OMS computes the remaining `leaves_qty`, rebuilds the `RoutingContext`, and re-runs the SOR automatically.
 
 ---
 
@@ -151,12 +149,12 @@ Constants were calibrated against internal fill data. Recalibrate for your excha
 
 ## Known limitations / TODO
 
-- Cancel-on-timeout: no timer wheel yet. Child orders that get no ack just sit in `PENDING_NEW` until a fill or cancel arrives. Add a timer wheel keyed by `sent_ns`.
+- No cancel-on-timeout. Child orders with no ack sit in `PENDING_NEW` indefinitely. Needs a timer wheel keyed by `sent_ns`.
 - Pool exhaustion drops the signal silently. Should push a reject back to the strategy queue.
-- Lot size is hardcoded to 0.001 in the notional check and the VWAP. Needs an instrument table.
+- Lot size hardcoded to 0.001 in the notional check and VWAP. Needs an instrument table.
 - Vol/imbalance at reroute time reuse the original signal values. Should re-read from the book.
-- Mixed lot sizes across exchanges (e.g. Deribit USD contracts vs BTC contracts) will break the routing context. The SOR assumes a common lot unit.
-- No maker routing. 100% taker. Mixed strategies need changes to the cost model and the fill rate estimate.
+- Mixed lot sizes across exchanges (e.g. Deribit USD contracts vs BTC contracts) will break the routing context.
+- No maker routing. 100% taker.
 
 ---
 
