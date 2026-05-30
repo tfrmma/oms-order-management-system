@@ -38,7 +38,7 @@ Three phases, all on the stack:
 
 3. **Fill** — greedy sweep over the sorted slices. Monotonic effective prices make greedy provably optimal here. Integer throughout until the fill decision is made, then doubles for reporting.
 
-Result: 11 child orders for a 5 BTC BUY across 5 exchanges, p99 under 2 µs on a Xeon Gold.
+Result: 11 child orders for a 5 BTC BUY across 5 exchanges, p99 under 2 µs.
 
 ---
 
