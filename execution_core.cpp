@@ -17,10 +17,32 @@ ExecutionCore::ExecutionCore(const ExecCoreConfig& cfg) noexcept
     , sor_(cfg.fees)
     , notional_gate_(cfg.notional_gate, cfg.dashboard.lot_size)
     , dashboard_(pool_, pos_, cfg.dashboard)
+    , timer_wheel_(1'000'000ULL)   // 1ms tick resolution
+    , margin_monitor_(cfg.margin, pos_)
     , cfg_(cfg)
 {
+    timer_wheel_.set_callback([this](child_id_t cid) {
+        // fired from the execution thread via tick() — safe to touch pool directly
+        if (cid >= kMaxTotalChildren) return;
+        ChildOrderState& child = pool_.child(cid);
+        if (child.state != OrderState::PENDING_NEW &&
+            child.state != OrderState::PARTIALLY_FILLED) return;
+
+        g_log.error("CHILD_TIMEOUT  child_id=%u  exchange=%u  sent_ns=%lu",
+                    cid, (unsigned)child.exchange_id, (unsigned long)child.sent_ns);
+
+        // synthesise a cancel report and process it through the normal path
+        ExecutionReport rep{};
+        rep.child_id    = cid;
+        rep.exec_type   = ExecType::CANCELED;
+        rep.exchange_id = child.exchange_id;
+        rep.recv_ns     = child.sent_ns; // best we have
+        on_execution_report(rep);
+    });
+
     dashboard_.start();
-    g_log.info("EXEC_CORE  INIT  exchanges=%u", cfg_.active_exchanges);
+    g_log.info("EXEC_CORE  INIT  exchanges=%u  child_timeout_ns=%lu",
+               cfg_.active_exchanges, (unsigned long)cfg_.child_timeout_ns);
 }
 
 void ExecutionCore::run() noexcept {
@@ -29,11 +51,18 @@ void ExecutionCore::run() noexcept {
     ExecutionReport     rep{};
 
     while (__builtin_expect(running_, 1)) {
+        const uint64_t now = now_ns();
         while (strategy_queue.pop(sig))
             on_strategy_order(sig);
         while (exec_report_queue.pop(rep))
             on_execution_report(rep);
-        // TODO: timer wheel for cancel-on-timeout (acks that never arrive)
+
+        timer_wheel_.tick(now);
+
+        // check margin warnings every ~1s (cheap — just reads atomics)
+        if ((now & 0x3FFF'FFFF) == 0) [[unlikely]]
+            margin_monitor_.check_warnings(now);
+
         __builtin_ia32_pause();
     }
 }
@@ -160,6 +189,9 @@ void ExecutionCore::dispatch_child_orders(ParentOrder&                 parent,
             (long)child.qty_lots,
             (long)child.price);
 
+        // start the cancel-on-timeout clock
+        timer_wheel_.insert(cid_res.value, ts, cfg_.child_timeout_ns);
+
         OutboundOrder out{};
         out.child_id    = cid_res.value;
         out.price       = child.price;
@@ -207,12 +239,18 @@ void ExecutionCore::handle_fill(ChildOrderState&       child,
     child.state = (child.leaves_qty_lots == 0)
         ? OrderState::FILLED : OrderState::PARTIALLY_FILLED;
 
+    // fill arrived — cancel the timeout
+    timer_wheel_.cancel(child.child_id);
+
     g_log.info("FILL  child_id=%u  parent_id=%u  exchange=%u  fill_lots=%ld  fill_px_ticks=%ld  child_leaves=%ld",
         child.child_id, parent.parent_id,
         (unsigned)child.exchange_id,
         (long)rep.fill_qty_lots,
         (long)rep.fill_price_ticks,
         (long)child.leaves_qty_lots);
+
+    // update local margin estimate
+    margin_monitor_.on_fill(rep.fill_qty_lots, fill_px, cfg_.dashboard.lot_size);
 
     parent.cum_qty_lots   += rep.fill_qty_lots;
     parent.leaves_qty_lots = parent.total_qty_lots - parent.cum_qty_lots;
@@ -252,6 +290,11 @@ void ExecutionCore::handle_cancel_reject(ChildOrderState&       child,
     child.state = (rep.exec_type == ExecType::CANCELED)
         ? OrderState::CANCELED : OrderState::REJECTED;
 
+    timer_wheel_.cancel(child.child_id);
+    margin_monitor_.on_release(lost_lots,
+        static_cast<double>(child.price) * cfg_.exchange_states[child.exchange_id].book.tick_size,
+        cfg_.dashboard.lot_size);
+
     g_log.warn("CHILD_%s  child_id=%u  parent_id=%u  exchange=%u  lost_lots=%ld",
         (rep.exec_type == ExecType::CANCELED) ? "CANCELED" : "REJECTED",
         child.child_id, parent.parent_id,
@@ -274,10 +317,19 @@ void ExecutionCore::handle_cancel_reject(ChildOrderState&       child,
 void ExecutionCore::reroute_leaves(ParentOrder& parent) noexcept {
     g_log.warn("REROUTE  parent_id=%u  leaves_lots=%ld",
         parent.parent_id, (long)parent.leaves_qty_lots);
+
     build_routing_context(parent, parent.leaves_qty_lots, routing_ctx_);
-    // vol/imbalance are stale by a few ms here. good enough for a reroute.
-    // TODO: pull fresh values from the book at reroute time
-    routing_ctx_.decision_ns = now_ns();
+
+    // fetch fresh vol/imbalance — don't reuse the original signal values
+    const uint64_t now    = now_ns();
+    const auto inputs     = book_cache_.get_routing_inputs(parent.dir, now);
+    routing_ctx_.short_vol_factor = inputs.short_vol_factor;
+    routing_ctx_.book_imbalance   = inputs.book_imbalance;
+    routing_ctx_.decision_ns      = now;
+
+    if (!inputs.data_fresh)
+        g_log.warn("REROUTE  STALE_BOOK_DATA  parent_id=%u  using_zero_vol_imb",
+                   parent.parent_id);
 
     for (uint8_t s = 0; s < ParentOrder::kMaxChildrenPerParent; ++s) {
         if (!parent.has_child(s)) continue;
