@@ -10,6 +10,7 @@
 #include <iostream>
 #include <memory>
 #include <cstdint>
+#include <cstdio>
 
 using namespace oms;
 using namespace sor;
@@ -62,6 +63,10 @@ int main() {
     fees.rates[3][0] =  0.0000; fees.rates[3][1] =  0.0003;
     fees.rates[4][0] =  0.0002; fees.rates[4][1] =  0.0006;
 
+    // logger first — before anything can go wrong
+    g_log.init("oms.log");
+    g_log.info("DEMO_START  exchanges=%u", kMaxExchanges);
+
     alignas(kCacheLineBytes) ExchangeState states[kMaxExchanges]{};
     populate_mock_exchange(states[0], 0, 65100.0, 0.5, 0.40, 120.0, fees);
     populate_mock_exchange(states[1], 1, 65101.0, 0.5, 0.25, 350.0, fees);
@@ -87,6 +92,17 @@ int main() {
     }
     cfg.risk_limits.max_notional_usd    = 400'000.0;
     cfg.risk_limits.min_margin_required = 0.0;
+
+    // notional gate: auto-approve below 50K, hard block above 400K
+    cfg.notional_gate.auto_approve_usd = 50'000.0;
+    cfg.notional_gate.hard_block_usd   = 400'000.0;
+
+    // dashboard config
+    cfg.dashboard.lot_size        = 0.001;
+    cfg.dashboard.tick_size       = 0.5;
+    cfg.dashboard.instrument_name = "BTC-PERP";
+    cfg.dashboard.refresh_ms      = 250;
+    cfg.dashboard.instr_id        = 0;
 
     // ExecutionCore is ~2.6MB (order pool) — allocate it properly, not on the stack.
     // In production this lives as a member of the execution thread object.
