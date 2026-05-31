@@ -4,7 +4,7 @@
 // Single-threaded for demo purposes — in production the queues connect to
 // separate strategy, execution, and gateway threads.
 
-#include "oms/execution_core.hpp"
+#include "execution_core.hpp"
 
 #include <iomanip>
 #include <iostream>
