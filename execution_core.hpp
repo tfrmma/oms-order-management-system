@@ -8,8 +8,11 @@
 #include "logger.hpp"
 #include "notional_gate.hpp"
 #include "dashboard.hpp"
-#include "sor/routing_engine.hpp"
-#include "sor/exchange_state.hpp"
+#include "timer_wheel.hpp"
+#include "book_snapshot.hpp"
+#include "margin_monitor.hpp"
+#include "routing_engine.hpp"
+#include "exchange_state.hpp"
 
 namespace oms {
 
@@ -24,6 +27,8 @@ struct ExecCoreConfig {
     RiskLimits           risk_limits;
     NotionalGateConfig   notional_gate{};
     DashboardConfig      dashboard{};
+    MarginConfig         margin{};
+    uint64_t             child_timeout_ns{2'000'000'000ULL};  // 2s default
     sor::ExchangeState*  exchange_states{nullptr};
     uint32_t             active_exchanges{0};
     GatewayHandle        gateways[sor::kMaxExchanges]{};
@@ -42,6 +47,19 @@ public:
 
     InboundQueue<StrategyOrderSignal>  strategy_queue;
     InboundQueue<ExecutionReport>      exec_report_queue;
+
+    // feed handler / REST reconciliation threads call these
+    void on_mark_price(double mark_usd, double lot_size, instr_id_t instr_id) noexcept {
+        margin_monitor_.on_mark_price(mark_usd, lot_size, instr_id);
+    }
+    void on_rest_margin(double equity, double used, uint64_t ts_ns) noexcept {
+        margin_monitor_.on_rest_update(equity, used, ts_ns);
+    }
+    void on_book_snapshot(uint8_t exchange_id, double vol, double imb,
+                          double mid, uint64_t ts_ns) noexcept {
+        if (exchange_id < sor::kMaxExchanges)
+            book_cache_.exchanges[exchange_id].update(vol, imb, mid, ts_ns);
+    }
 
     [[nodiscard]] const PositionTable& positions() const noexcept { return pos_; }
     [[nodiscard]] const OMSOrderPool&  pool()      const noexcept { return pool_; }
@@ -71,6 +89,9 @@ private:
     sor::RoutingEngine      sor_;
     NotionalConfirmationGate notional_gate_;
     Dashboard               dashboard_;
+    TimerWheel              timer_wheel_;
+    BookSnapshotCache       book_cache_{};
+    MarginMonitor           margin_monitor_;
     ExecCoreConfig          cfg_;
 
     sor::ChildOrderBuffer   child_buf_{};
