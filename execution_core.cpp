@@ -15,8 +15,13 @@ namespace oms {
 ExecutionCore::ExecutionCore(const ExecCoreConfig& cfg) noexcept
     : risk_(cfg.risk_limits, pos_)
     , sor_(cfg.fees)
+    , notional_gate_(cfg.notional_gate, cfg.dashboard.lot_size)
+    , dashboard_(pool_, pos_, cfg.dashboard)
     , cfg_(cfg)
-{}
+{
+    dashboard_.start();
+    g_log.info("EXEC_CORE  INIT  exchanges=%u", cfg_.active_exchanges);
+}
 
 void ExecutionCore::run() noexcept {
     running_ = true;
@@ -34,9 +39,22 @@ void ExecutionCore::run() noexcept {
 }
 
 void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
+    g_log.debug("ORDER_NEW  instr=%u  dir=%s  qty=%ld  limit_usd=%.2f  vol=%.3f  imb=%.3f",
+        (unsigned)sig.instr_id,
+        (sig.dir == sor::OrderDir::BUY) ? "BUY" : "SELL",
+        (long)sig.qty_lots,
+        sig.limit_price_usd,
+        sig.short_vol_factor,
+        sig.book_imbalance);
+
+    if (!notional_gate_.approve(sig)) {
+        g_log.warn("ORDER_BLOCKED_NOTIONAL_GATE  instr=%u  qty=%ld", (unsigned)sig.instr_id, (long)sig.qty_lots);
+        return;
+    }
+
     const auto id_res = pool_.alloc_parent();
     if (!id_res.ok) [[unlikely]] {
-        // pool exhausted. shouldn't happen — TODO: push reject back to strategy
+        g_log.error("POOL_EXHAUSTED  parents_in_use=%u  SIGNAL_DROPPED", pool_.parents_in_use());
         return;
     }
 
@@ -57,6 +75,8 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
         : price_t(0);
 
     if (risk_.validate(sig) != RiskRejectReason::OK) [[unlikely]] {
+        g_log.error("RISK_REJECT  parent_id=%u  instr=%u  qty=%ld  limit_usd=%.2f",
+            id_res.value, (unsigned)sig.instr_id, (long)sig.qty_lots, sig.limit_price_usd);
         parent.state = OrderState::REJECTED;
         pool_.free_parent(id_res.value);
         return;
@@ -70,7 +90,14 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
     child_buf_.reset();
     const sor::SplitResult split = sor_.calculate_optimal_split(routing_ctx_, child_buf_);
 
+    g_log.info("SOR_RESULT  parent_id=%u  children=%u  filled_qty=%.4f  unfilled=%.4f  avg_px=%.2f  success=%d",
+        id_res.value, child_buf_.count,
+        split.filled_qty, split.unfilled_qty,
+        split.avg_effective_price, (int)split.success);
+
     if (child_buf_.count == 0) [[unlikely]] {
+        g_log.error("SOR_NO_LIQUIDITY  parent_id=%u  instr=%u  limit_usd=%.2f",
+            id_res.value, (unsigned)sig.instr_id, sig.limit_price_usd);
         parent.state = OrderState::REJECTED;
         pool_.free_parent(id_res.value);
         return;
@@ -127,6 +154,12 @@ void ExecutionCore::dispatch_child_orders(ParentOrder&                 parent,
 
         parent.add_child(static_cast<uint8_t>(i), cid_res.value);
 
+        g_log.debug("CHILD_DISPATCH  child_id=%u  parent_id=%u  exchange=%u  qty_lots=%ld  price_ticks=%ld",
+            cid_res.value, parent.parent_id,
+            (unsigned)co.exchange_id,
+            (long)child.qty_lots,
+            (long)child.price);
+
         OutboundOrder out{};
         out.child_id    = cid_res.value;
         out.price       = child.price;
@@ -174,6 +207,13 @@ void ExecutionCore::handle_fill(ChildOrderState&       child,
     child.state = (child.leaves_qty_lots == 0)
         ? OrderState::FILLED : OrderState::PARTIALLY_FILLED;
 
+    g_log.info("FILL  child_id=%u  parent_id=%u  exchange=%u  fill_lots=%ld  fill_px_ticks=%ld  child_leaves=%ld",
+        child.child_id, parent.parent_id,
+        (unsigned)child.exchange_id,
+        (long)rep.fill_qty_lots,
+        (long)rep.fill_price_ticks,
+        (long)child.leaves_qty_lots);
+
     parent.cum_qty_lots   += rep.fill_qty_lots;
     parent.leaves_qty_lots = parent.total_qty_lots - parent.cum_qty_lots;
     parent.last_update_ns  = rep.recv_ns;
@@ -190,11 +230,16 @@ void ExecutionCore::handle_fill(ChildOrderState&       child,
     pos_.instruments[parent.instr_id].release_open(parent.dir, rep.fill_qty_lots);
 
     if (parent.leaves_qty_lots == 0) {
+        g_log.info("PARENT_FILLED  parent_id=%u  avg_fill_px=%.4f  total_qty=%.4f",
+            parent.parent_id, parent.avg_fill_price,
+            static_cast<double>(parent.total_qty_lots) * cfg_.dashboard.lot_size);
         parent.state = OrderState::FILLED;
         for (uint8_t s = 0; s < ParentOrder::kMaxChildrenPerParent; ++s)
             if (parent.has_child(s)) pool_.free_child(parent.children[s]);
         pool_.free_parent(parent.parent_id);
     } else {
+        g_log.debug("PARENT_PARTIAL  parent_id=%u  leaves_lots=%ld",
+            parent.parent_id, (long)parent.leaves_qty_lots);
         parent.state = OrderState::PARTIALLY_FILLED;
     }
 }
@@ -206,6 +251,11 @@ void ExecutionCore::handle_cancel_reject(ChildOrderState&       child,
     child.leaves_qty_lots  = 0;
     child.state = (rep.exec_type == ExecType::CANCELED)
         ? OrderState::CANCELED : OrderState::REJECTED;
+
+    g_log.warn("CHILD_%s  child_id=%u  parent_id=%u  exchange=%u  lost_lots=%ld",
+        (rep.exec_type == ExecType::CANCELED) ? "CANCELED" : "REJECTED",
+        child.child_id, parent.parent_id,
+        (unsigned)child.exchange_id, (long)lost_lots);
 
     pos_.instruments[parent.instr_id].release_open(parent.dir, lost_lots);
     parent.last_update_ns = rep.recv_ns;
@@ -222,6 +272,8 @@ void ExecutionCore::handle_cancel_reject(ChildOrderState&       child,
 }
 
 void ExecutionCore::reroute_leaves(ParentOrder& parent) noexcept {
+    g_log.warn("REROUTE  parent_id=%u  leaves_lots=%ld",
+        parent.parent_id, (long)parent.leaves_qty_lots);
     build_routing_context(parent, parent.leaves_qty_lots, routing_ctx_);
     // vol/imbalance are stale by a few ms here. good enough for a reroute.
     // TODO: pull fresh values from the book at reroute time
@@ -242,6 +294,8 @@ void ExecutionCore::reroute_leaves(ParentOrder& parent) noexcept {
     sor_.calculate_optimal_split(routing_ctx_, child_buf_);
 
     if (child_buf_.count == 0) [[unlikely]] {
+        g_log.error("REROUTE_NO_LIQUIDITY  parent_id=%u  leaves_lots=%ld  PARKED_AS_PARTIAL",
+            parent.parent_id, (long)parent.leaves_qty_lots);
         parent.state = OrderState::PARTIALLY_FILLED;
         return;
     }
