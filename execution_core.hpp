@@ -5,6 +5,9 @@
 #include "position_tracker.hpp"
 #include "risk_engine.hpp"
 #include "spsc_queue.hpp"
+#include "logger.hpp"
+#include "notional_gate.hpp"
+#include "dashboard.hpp"
 #include "sor/routing_engine.hpp"
 #include "sor/exchange_state.hpp"
 
@@ -19,6 +22,8 @@ struct GatewayHandle {
 struct ExecCoreConfig {
     sor::FeeMatrix       fees;
     RiskLimits           risk_limits;
+    NotionalGateConfig   notional_gate{};
+    DashboardConfig      dashboard{};
     sor::ExchangeState*  exchange_states{nullptr};
     uint32_t             active_exchanges{0};
     GatewayHandle        gateways[sor::kMaxExchanges]{};
@@ -60,14 +65,16 @@ private:
 
     [[nodiscard]] bool all_children_terminal(const ParentOrder& parent) const noexcept;
 
-    OMSOrderPool       pool_{};
-    PositionTable      pos_{};
-    PreTradeRiskEngine risk_;
-    sor::RoutingEngine sor_;
-    ExecCoreConfig     cfg_;
+    OMSOrderPool            pool_{};
+    PositionTable           pos_{};
+    PreTradeRiskEngine      risk_;
+    sor::RoutingEngine      sor_;
+    NotionalConfirmationGate notional_gate_;
+    Dashboard               dashboard_;
+    ExecCoreConfig          cfg_;
 
-    sor::ChildOrderBuffer child_buf_{};
-    sor::RoutingContext   routing_ctx_{};
+    sor::ChildOrderBuffer   child_buf_{};
+    sor::RoutingContext     routing_ctx_{};
 
     bool running_{false};
 };
