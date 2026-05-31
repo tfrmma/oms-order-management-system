@@ -41,6 +41,9 @@ target_link_libraries(sor_example PRIVATE sor_lib)
 add_executable(oms_example oms_example.cpp)
 target_include_directories(oms_example PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/oms)
 target_link_libraries(oms_example PRIVATE oms_lib)
+# logger drain thread + dashboard thread need pthreads
+find_package(Threads REQUIRED)
+target_link_libraries(oms_lib PUBLIC Threads::Threads)
 
 # ── ASan + UBSan ──────────────────────────────────────────────────────────────
 add_executable(oms_example_san
