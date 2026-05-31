@@ -62,3 +62,24 @@ target_compile_options(oms_example_san PRIVATE
 target_link_options(oms_example_san PRIVATE -fsanitize=address,undefined)
 
 install(TARGETS sor_example oms_example DESTINATION bin)
+
+# ── Tests (Catch2 amalgamated) ────────────────────────────────────────────────
+add_library(catch2_lib STATIC tests/catch_amalgamated.cpp)
+target_include_directories(catch2_lib PUBLIC tests/)
+target_compile_options(catch2_lib PRIVATE -O1 -fno-exceptions -fno-rtti)
+
+add_executable(oms_tests
+    tests/test_oms.cpp
+    sor/routing_engine.cpp
+    oms/execution_core.cpp
+)
+target_include_directories(oms_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/oms
+    tests/
+)
+target_compile_options(oms_tests PRIVATE
+    -O1 -g -fno-exceptions -fno-rtti
+    -Wall -Wextra -Wno-unused-parameter
+)
+target_link_libraries(oms_tests PRIVATE catch2_lib Threads::Threads)
