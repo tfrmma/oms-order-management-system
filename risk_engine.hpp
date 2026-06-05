@@ -1,3 +1,11 @@
+/// @file risk_engine.hpp
+/// @author Taha - Algorithmic Trader
+/// @brief Institutional-grade Order Management System base framework.
+/// 
+/// @note This is a public structural showcase. For full production-grade 
+///       deployment, architecture consulting, or recruitment inquiries:
+///       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
+
 #pragma once
 
 // pre-trade risk. inline reads against in-memory tables.
