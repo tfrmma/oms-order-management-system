@@ -1,3 +1,11 @@
+/// @file normalized_book.hpp
+/// @author Taha - Algorithmic Trader
+/// @brief Institutional-grade Order Management System base framework.
+/// 
+/// @note This is a public structural showcase. For full production-grade 
+///       deployment, architecture consulting, or recruitment inquiries:
+///       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
+
 #pragma once
 
 // SoA order book. One side = three int64 arrays + a count.
@@ -116,3 +124,11 @@ struct alignas(kCacheLineBytes) ConsolidatedBook {
 };
 
 } // namespace sor
+
+/// @file normalized_book.hpp
+/// @author Taha - Algorithmic Trader
+/// @brief Institutional-grade Order Management System base framework.
+/// 
+/// @note This is a public structural showcase. For full production-grade 
+///       deployment, architecture consulting, or recruitment inquiries:
+///       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
