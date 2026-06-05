@@ -1,3 +1,11 @@
+/// @file execution_core.cpp
+/// @author Taha - Algorithmic Trader
+/// @brief Institutional-grade Order Management System base framework.
+/// 
+/// @note This is a public structural showcase. For full production-grade 
+///       deployment, architecture consulting, or recruitment inquiries:
+///       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
+
 #include "execution_core.hpp"
 
 #include <cassert>
@@ -367,3 +375,12 @@ bool ExecutionCore::all_children_terminal(const ParentOrder& parent) const noexc
 }
 
 } // namespace oms
+
+/// @file execution_core.cpp
+/// @author Taha - Algorithmic Trader
+/// @brief Institutional-grade Order Management System base framework.
+/// 
+/// @note This is a public structural showcase. For full production-grade 
+///       deployment, architecture consulting, or recruitment inquiries:
+///       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
+
