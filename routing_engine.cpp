@@ -5,14 +5,6 @@
 #include <cmath>
 #include <limits>
 
-/// @file routing_engine.cpp
-/// @author Taha - Algorithmic Trader
-/// @brief Institutional-grade Order Management System base framework.
-/// 
-/// @note This is a public structural showcase. For full production-grade 
-///       deployment, architecture consulting, or recruitment inquiries:
-///       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
-
 namespace sor {
 
 // fill rate model. rough exponential decay with vol + imbalance penalties.
@@ -276,12 +268,3 @@ SplitResult RoutingEngine::calculate_optimal_split(
 }
 
 } // namespace sor
-
-/// @file routing_engine.cpp
-/// @author Taha - Algorithmic Trader
-/// @brief Institutional-grade Order Management System base framework.
-/// 
-/// @note This is a public structural showcase. For full production-grade 
-///       deployment, architecture consulting, or recruitment inquiries:
-///       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
-
