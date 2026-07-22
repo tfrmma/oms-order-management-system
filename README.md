@@ -89,6 +89,21 @@ make oms_example_san -j$(nproc)
 ./oms_example_san
 ```
 
+Unit tests (Catch2, vendored amalgamated in `tests/`):
+```bash
+make oms_tests -j$(nproc)
+./oms_tests
+```
+
+Covers the SOR merge/fill algorithm (single and multi-exchange, partial fills,
+limit price clipping, BUY/SELL sign handling), `OMSOrderPool` alloc/free,
+`InstrumentPosition` avg price tracking, `PreTradeRiskEngine` rejection paths,
+`SpscQueue`, and `TimerWheel`. Built with `-fno-exceptions` like the rest of
+the project, Catch2 auto-detects this and switches `REQUIRE` to abort the
+whole binary on failure instead of just the failing test case (no exceptions
+to unwind with). Fine for CI, just means a single regression kills the run
+before the rest of the suite gets a chance to report.
+
 ---
 
 ## Using it
@@ -151,14 +166,12 @@ Constants were calibrated against internal fill data. Recalibrate for your excha
 
 ## Known limitations / TODO
 
-- **Build-blocking gap:** `oms/execution_core.hpp` includes `dashboard.hpp` and uses `Dashboard`/`DashboardConfig` (constructed in `ExecutionCore`, started in `execution_core.cpp`, configured in `oms_example.cpp`), but `dashboard.hpp` is not present anywhere in this repo. `oms_lib`/`oms_example`/`oms_tests` will not compile until it's added.
-- **Build-blocking gap:** `CMakeLists.txt` references `tests/catch_amalgamated.cpp` and `tests/test_oms.cpp` (Catch2 test suite) for the `oms_tests` target, but the `tests/` directory doesn't exist in this repo.
-- No cancel-on-timeout. Child orders with no ack sit in `PENDING_NEW` indefinitely. Needs a timer wheel keyed by `sent_ns`.
-- Pool exhaustion drops the signal silently. Should push a reject back to the strategy queue.
-- Lot size hardcoded to 0.001 in the notional check and VWAP. Needs an instrument table.
+- Lot size hardcoded to 0.001 in the notional check and VWAP (`oms/risk_engine.hpp`). Needs an instrument table.
+- Pool exhaustion logs and drops the signal (`POOL_EXHAUSTED ... SIGNAL_DROPPED`). Should push a reject back to the strategy queue instead.
 - Vol/imbalance at reroute time reuse the original signal values. Should re-read from the book.
 - Mixed lot sizes across exchanges (e.g. Deribit USD contracts vs BTC contracts) will break the routing context.
 - No maker routing. 100% taker.
+- `oms_example_san` duplicates sources instead of linking `sor_lib`/`oms_lib`, easy to forget to update if a new file gets added to either.
 
 ---
 
