@@ -83,7 +83,8 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
 
     const auto id_res = pool_.alloc_parent();
     if (!id_res.ok) [[unlikely]] {
-        g_log.error("POOL_EXHAUSTED  parents_in_use=%u  SIGNAL_DROPPED", pool_.parents_in_use());
+        g_log.error("POOL_EXHAUSTED  parents_in_use=%u  total_failures=%lu  SIGNAL_DROPPED",
+            pool_.parents_in_use(), (unsigned long)pool_.parent_alloc_failures());
         return;
     }
 
@@ -148,6 +149,11 @@ void ExecutionCore::build_routing_context(const ParentOrder&    parent,
     ctx.limit_price      = (parent.limit_price > 0)
         ? static_cast<double>(parent.limit_price) * cfg_.exchange_states[0].book.tick_size
         : 0.0;
+    // same per-instrument lot_size the risk engine uses for the notional check,
+    // one source of truth instead of two places assuming states[0]'s lot size.
+    // 0 here just means "not configured", RoutingContext falls back to
+    // states[0].book.lot_size on its own, same as leaving this field untouched.
+    ctx.reference_lot_size = cfg_.risk_limits.lot_size[parent.instr_id];
     ctx.short_vol_factor = 0.0;
     ctx.book_imbalance   = 0.0;
 }
@@ -163,7 +169,15 @@ void ExecutionCore::dispatch_child_orders(ParentOrder&                 parent,
 
         const sor::ChildOrder& co = buf.orders[i];
         const auto cid_res = pool_.alloc_child();
-        if (!cid_res.ok) [[unlikely]] break;
+        if (!cid_res.ok) [[unlikely]] {
+            g_log.error("CHILD_POOL_EXHAUSTED  parent_id=%u  dispatched=%u  of=%u  total_failures=%lu",
+                parent.parent_id, i, buf.count, (unsigned long)pool_.child_alloc_failures());
+            // TODO: parent.leaves_qty_lots and pos_.reserve_open() above both
+            // assume the full sig.qty_lots got dispatched. if we stop short
+            // here, they're now out of sync with what's actually working at
+            // the exchange, nothing currently reconciles that gap.
+            break;
+        }
 
         const double tick_sz = cfg_.exchange_states[co.exchange_id].book.tick_size;
         const double lot_sz  = cfg_.exchange_states[co.exchange_id].book.lot_size;
