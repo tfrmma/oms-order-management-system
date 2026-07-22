@@ -9,7 +9,7 @@
 // cancel callbacks directly. keeping it domain-specific keeps it fast.
 //
 // called from the execution thread on every spin iteration via tick().
-// tick() is cheap when nothing expires — just a counter increment and
+// tick() is cheap when nothing expires, just a counter increment and
 // a slot check. no heap, no locks.
 
 #include "oms_types.hpp"
@@ -31,7 +31,7 @@ struct TimerEntry {
 };
 
 // 1024 fine slots × 64 coarse slots = ~65 seconds of coverage at 1ms resolution.
-// slots are hashed by deadline — collisions are resolved by scanning the slot.
+// slots are hashed by deadline, collisions are resolved by scanning the slot.
 // slot depth of 8 handles bursts of simultaneous orders without spilling.
 inline constexpr uint32_t kFineSlots   = 1024;
 inline constexpr uint32_t kSlotDepth  = 8;     // max concurrent timers per slot
@@ -47,7 +47,7 @@ public:
     }
 
     // insert a timeout for child_id, deadline_ns nanoseconds from now.
-    // returns false if the slot is full — caller should log and treat as cancel.
+    // returns false if the slot is full, caller should log and treat as cancel.
     bool insert(child_id_t child_id, uint64_t now_ns, uint64_t timeout_ns) noexcept {
         const uint64_t deadline = now_ns + timeout_ns;
         const uint32_t slot     = slot_for(deadline);
@@ -67,9 +67,9 @@ public:
         return false;
     }
 
-    // cancel a timer — called when a fill or ack arrives before timeout.
+    // cancel a timer, called when a fill or ack arrives before timeout.
     void cancel(child_id_t child_id) noexcept {
-        // scan all slots of the expected deadline range — we don't store the slot
+        // scan all slots of the expected deadline range, we don't store the slot
         // index per child_id to avoid extra state. at kFineSlots=1024 this is
         // acceptable: cancel is rare (it's the happy path).
         for (uint32_t s = 0; s < kFineSlots; ++s) {
@@ -81,7 +81,7 @@ public:
                 }
             }
         }
-        // not found — probably already fired or never inserted. not an error.
+        // not found, probably already fired or never inserted. not an error.
     }
 
     // call on every execution loop iteration.
