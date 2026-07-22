@@ -9,7 +9,7 @@ namespace sor {
 
 // fill rate model. rough exponential decay with vol + imbalance penalties.
 // numbers are eyeballed against our own fill data; recalibrate if you have better.
-// TODO: kLatDecay should probably be per-exchange — deribit and binance are not
+// TODO: kLatDecay should probably be per-exchange, deribit and binance are not
 // the same beast at 800us. leaving it flat for now.
 static constexpr double kLatDecay       = 2e-4;
 static constexpr double kVolFillPenalty = 0.10;
@@ -36,8 +36,7 @@ double RoutingEngine::estimate_fill_rate(
 }
 
 // fully integer: limit check against c.limit_ticks, qty check against c.min_lots.
-// terminates the cursor early on limit violation because levels are sorted —
-// if pt > limit (BUY) then pt+1, pt+2... are also > limit. not rocket science.
+// terminates the cursor early on limit violation because levels are sorted, // if pt > limit (BUY) then pt+1, pt+2... are also > limit. not rocket science.
 void RoutingEngine::seek_next_valid(Cursor& c) noexcept {
     while (c.level_idx < c.levels->count) {
         const price_t pt = c.levels->price_ticks[c.level_idx];
@@ -93,7 +92,7 @@ void RoutingEngine::build_cost_slices(
         c.tick_size = state.book.tick_size;
         c.lot_size  = state.book.lot_size;
 
-        // FPU work for this cursor — all happens once, here, before the merge loop.
+        // FPU work for this cursor, all happens once, here, before the merge loop.
         c.fill_rate = estimate_fill_rate(
             state.latency.get_rtt_us(), ctx.short_vol_factor, directional_imb);
 
@@ -164,7 +163,7 @@ void RoutingEngine::build_cost_slices(
 // Phase 2. greedy sweep over the sorted slices.
 //
 // remaining_lots is qty_t the whole way through. fill decision is a single
-// integer min. remaining_lots == 0 is an exact test — no epsilon, no rounding
+// integer min. remaining_lots == 0 is an exact test, no epsilon, no rounding
 // drama. that's the whole point of going integer in the first place.
 //
 // FPU shows up only when writing ChildOrder / SplitResult fields, i.e. after
@@ -200,7 +199,7 @@ SplitResult RoutingEngine::greedy_fill(
                                 : slice.available_lots;
 
         // TODO: move min_lots into CostSlice to avoid this division per fill.
-        // fine for now — it's not the comparison inner loop.
+        // fine for now, it's not the comparison inner loop.
         const qty_t min_lots = static_cast<qty_t>(
             std::round(state.lot.min_qty / state.lot.lot_size));
         if (fill_lots < min_lots) [[unlikely]] continue;
