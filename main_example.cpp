@@ -1,5 +1,5 @@
 // synthetic 5-exchange demo. good enough to shake out bugs.
-// don't read too much into the numbers — books are made up.
+// don't read too much into the numbers, books are made up.
 //
 // compile:
 //   g++ -std=c++20 -O3 -march=native -fno-exceptions
@@ -100,7 +100,7 @@ int main() {
 
     std::cout << std::fixed << std::setprecision(4);
     std::cout << "══════════════════════════════════════════════════════════\n";
-    std::cout << "  Smart Order Router — Split Result\n";
+    std::cout << "  Smart Order Router: Split Result\n";
     std::cout << "══════════════════════════════════════════════════════════\n";
     std::cout << "  Direction:          BUY\n";
     std::cout << "  Target:             " << from_lots(ctx.target_lots, 0.001)
