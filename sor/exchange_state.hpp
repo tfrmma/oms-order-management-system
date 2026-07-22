@@ -97,18 +97,24 @@ struct alignas(kCacheLineBytes) ExchangeState {
 // target_lots: order size in integer lots, the engine doesn't know what a "Bitcoin" is.
 // caller converts via to_lots() before filling this in.
 //
+// reference_lot_size: real-world size of 1 unit of target_lots (e.g. 0.001 BTC).
+// this is the canonical unit the whole routing decision is expressed in. every
+// active exchange gets converted into it internally, so target_lots means the
+// same thing regardless of whether you're mixing a linear BTC book (lot_size
+// 0.001 BTC) with an inverse USD contract book (lot_size 1 USD) in the same
+// call. leave at 0 and the engine falls back to states[0]'s lot_size, which is
+// the old behavior and is exactly correct as long as every active exchange
+// shares one lot granularity.
+//
 // short_vol_factor / book_imbalance: if you don't have these yet, pass 0 for both.
 // the cost model degrades gracefully to the original static penalty.
-//
-// TODO: multi-lot-size support. right now we assume all active exchanges share
-// the same lot granularity (target_lots uses the common unit). works for our
-// current universe; becomes wrong if you add e.g. Deribit USD contracts.
 struct RoutingContext {
     ExchangeState* states;
     uint32_t       active_exchanges;
     OrderDir       dir;
     qty_t          target_lots;
     double         limit_price;    // 0 = no limit
+    double         reference_lot_size{0.0}; // 0 = use states[0].book.lot_size
     uint64_t       decision_ns;
     double         short_vol_factor;
     double         book_imbalance;
