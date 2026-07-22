@@ -1,6 +1,7 @@
 #pragma once
 
 #include "oms_types.hpp"
+#include <atomic>
 #include <cstring>
 #include <cassert>
 
@@ -73,7 +74,10 @@ public:
     OMSOrderPool() noexcept { init(); }
 
     [[nodiscard]] Result<order_id_t> alloc_parent() noexcept {
-        if (parent_free_top_ == 0) [[unlikely]] return Result<order_id_t>::fail();
+        if (parent_free_top_ == 0) [[unlikely]] {
+            parent_alloc_failures_.fetch_add(1, std::memory_order_relaxed);
+            return Result<order_id_t>::fail();
+        }
         const order_id_t id = parent_free_[--parent_free_top_];
         parents_[id].reset();
         parents_[id].parent_id = id;
@@ -81,7 +85,10 @@ public:
     }
 
     [[nodiscard]] Result<child_id_t> alloc_child() noexcept {
-        if (child_free_top_ == 0) [[unlikely]] return Result<child_id_t>::fail();
+        if (child_free_top_ == 0) [[unlikely]] {
+            child_alloc_failures_.fetch_add(1, std::memory_order_relaxed);
+            return Result<child_id_t>::fail();
+        }
         const child_id_t id = child_free_[--child_free_top_];
         std::memset(&children_[id], 0, sizeof(ChildOrderState));
         children_[id].child_id = id;
@@ -106,6 +113,15 @@ public:
     [[nodiscard]] uint32_t parents_in_use()  const noexcept { return kMaxParentOrders  - parent_free_top_; }
     [[nodiscard]] uint32_t children_in_use() const noexcept { return kMaxTotalChildren - child_free_top_;  }
 
+    // cumulative, since process start. a nonzero reading means the pool has
+    // been too small at least once, monitor this instead of grepping logs.
+    [[nodiscard]] uint64_t parent_alloc_failures() const noexcept {
+        return parent_alloc_failures_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint64_t child_alloc_failures() const noexcept {
+        return child_alloc_failures_.load(std::memory_order_relaxed);
+    }
+
 private:
     void init() noexcept {
         for (uint32_t i = 0; i < kMaxParentOrders; ++i)
@@ -125,6 +141,9 @@ private:
 
     child_id_t  child_free_[kMaxTotalChildren]{};
     uint32_t    child_free_top_{0};
+
+    std::atomic<uint64_t> parent_alloc_failures_{0};
+    std::atomic<uint64_t> child_alloc_failures_{0};
 };
 
 } // namespace oms
