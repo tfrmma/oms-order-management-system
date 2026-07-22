@@ -22,7 +22,7 @@ ExecutionCore::ExecutionCore(const ExecCoreConfig& cfg) noexcept
     , cfg_(cfg)
 {
     timer_wheel_.set_callback([this](child_id_t cid) {
-        // fired from the execution thread via tick() — safe to touch pool directly
+        // fired from the execution thread via tick(), safe to touch pool directly
         if (cid >= kMaxTotalChildren) return;
         ChildOrderState& child = pool_.child(cid);
         if (child.state != OrderState::PENDING_NEW &&
@@ -59,7 +59,7 @@ void ExecutionCore::run() noexcept {
 
         timer_wheel_.tick(now);
 
-        // check margin warnings every ~1s (cheap — just reads atomics)
+        // check margin warnings every ~1s (cheap, just reads atomics)
         if ((now & 0x3FFF'FFFF) == 0) [[unlikely]]
             margin_monitor_.check_warnings(now);
 
@@ -239,7 +239,7 @@ void ExecutionCore::handle_fill(ChildOrderState&       child,
     child.state = (child.leaves_qty_lots == 0)
         ? OrderState::FILLED : OrderState::PARTIALLY_FILLED;
 
-    // fill arrived — cancel the timeout
+    // fill arrived, cancel the timeout
     timer_wheel_.cancel(child.child_id);
 
     g_log.info("FILL  child_id=%u  parent_id=%u  exchange=%u  fill_lots=%ld  fill_px_ticks=%ld  child_leaves=%ld",
@@ -320,7 +320,7 @@ void ExecutionCore::reroute_leaves(ParentOrder& parent) noexcept {
 
     build_routing_context(parent, parent.leaves_qty_lots, routing_ctx_);
 
-    // fetch fresh vol/imbalance — don't reuse the original signal values
+    // fetch fresh vol/imbalance, don't reuse the original signal values
     const uint64_t now    = now_ns();
     const auto inputs     = book_cache_.get_routing_inputs(parent.dir, now);
     routing_ctx_.short_vol_factor = inputs.short_vol_factor;
