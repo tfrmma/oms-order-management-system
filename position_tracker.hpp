@@ -1,7 +1,7 @@
 #pragma once
 
 // position + margin state. network/reconciliation thread writes, risk reads.
-// only net_qty_lots and margin_available are truly hot — everything else
+// only net_qty_lots and margin_available are truly hot, everything else
 // is updated between cycles.
 
 #include "oms_types.hpp"
@@ -29,7 +29,7 @@ struct alignas(kCacheLine) InstrumentPosition {
 
         double next_avg = 0.0;
         if (next_abs > 1e-9) {
-            // side flip resets the cost basis — could argue for a smarter model
+            // side flip resets the cost basis, could argue for a smarter model
             if ((prev >= 0) == (next >= 0))
                 next_avg = (prev_avg * prev_abs + price * fill_abs) / (prev_abs + fill_abs);
             else
@@ -52,7 +52,7 @@ struct alignas(kCacheLine) InstrumentPosition {
 };
 static_assert(alignof(InstrumentPosition) == kCacheLine);
 
-// margin updated async via REST reconciliation — not real-time, not perfect.
+// margin updated async via REST reconciliation, not real-time, not perfect.
 // real-time margin would need a dedicated WS feed per exchange. out of scope.
 struct alignas(kCacheLine) MarginState {
     std::atomic<double>   total_equity{0.0};
