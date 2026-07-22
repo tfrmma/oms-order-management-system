@@ -11,6 +11,7 @@ namespace oms {
 struct RiskLimits {
     qty_t   max_order_lots[kMaxInstruments]{};
     qty_t   max_net_lots[kMaxInstruments]{};
+    double  lot_size[kMaxInstruments]{};   // real-world qty of 1 lot, e.g. 0.001 BTC. 0 = unconfigured, falls back to kFallbackLotSize
     double  max_notional_usd{0.0};
     double  min_margin_required{0.0};
 };
@@ -79,8 +80,14 @@ private:
     [[nodiscard]] __attribute__((always_inline))
     RiskRejectReason check_margin(const StrategyOrderSignal& sig) const noexcept {
         if (limits_.max_notional_usd > 0.0 && sig.limit_price_usd > 0.0) {
-            constexpr double kLotSize = 0.001; // TODO: pull from instrument table
-            const double notional = static_cast<double>(sig.qty_lots) * kLotSize * sig.limit_price_usd;
+            // fall back to the old hardcoded default if this instrument's
+            // lot_size was never configured, so an unconfigured entry degrades
+            // to the previous behavior instead of silently disabling the check
+            // (a zero lot_size would make notional always compute to 0).
+            const double lot_size = (limits_.lot_size[sig.instr_id] > 0.0)
+                ? limits_.lot_size[sig.instr_id]
+                : kFallbackLotSize;
+            const double notional = static_cast<double>(sig.qty_lots) * lot_size * sig.limit_price_usd;
             if (notional > limits_.max_notional_usd)
                 return RiskRejectReason::NOTIONAL;
         }
@@ -88,6 +95,8 @@ private:
             ? RiskRejectReason::MARGIN
             : RiskRejectReason::OK;
     }
+
+    static constexpr double kFallbackLotSize = 0.001;
 
     RiskLimits           limits_;
     const PositionTable& pos_;
