@@ -1,7 +1,7 @@
 #pragma once
 
 // per-exchange state: book, latency tracker, lot constraints.
-// also home to RoutingContext — the thing you fill in before calling the engine.
+// also home to RoutingContext, the thing you fill in before calling the engine.
 //
 // thread model: network thread writes book + updates EWMA, routing thread reads.
 // the only shared mutable state is ewma_rtt_us (atomic<double>). everything else
@@ -94,7 +94,7 @@ struct alignas(kCacheLineBytes) ExchangeState {
 
 // snapshot of everything the engine needs for one routing decision.
 //
-// target_lots: order size in integer lots — the engine doesn't know what a "Bitcoin" is.
+// target_lots: order size in integer lots, the engine doesn't know what a "Bitcoin" is.
 // caller converts via to_lots() before filling this in.
 //
 // short_vol_factor / book_imbalance: if you don't have these yet, pass 0 for both.
