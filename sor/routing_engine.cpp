@@ -24,6 +24,12 @@ void RoutingEngine::update_fees(const FeeMatrix& fees) noexcept {
     fees_ = fees;
 }
 
+double RoutingEngine::resolve_reference_lot_size(const RoutingContext& ctx) noexcept {
+    return (ctx.reference_lot_size > 0.0)
+        ? ctx.reference_lot_size
+        : ctx.states[0].book.lot_size;
+}
+
 double RoutingEngine::estimate_fill_rate(
     double rtt_us, double vol_factor, double directional_imb
 ) noexcept {
@@ -82,6 +88,8 @@ void RoutingEngine::build_cost_slices(
     std::array<Cursor, kMaxExchanges> cursors;
     uint32_t ncursors = 0;
 
+    const double ref_lot_size = resolve_reference_lot_size(ctx);
+
     for (uint32_t ex = 0; ex < ctx.active_exchanges; ++ex) {
         const ExchangeState& state = ctx.states[ex];
         if (!state.enabled || !state.book.is_valid) [[unlikely]] continue;
@@ -91,6 +99,7 @@ void RoutingEngine::build_cost_slices(
         c.levels    = &state.book.sides[side_idx];
         c.tick_size = state.book.tick_size;
         c.lot_size  = state.book.lot_size;
+        c.lot_ratio = c.lot_size / ref_lot_size;
 
         // FPU work for this cursor, all happens once, here, before the merge loop.
         c.fill_rate = estimate_fill_rate(
@@ -151,9 +160,16 @@ void RoutingEngine::build_cost_slices(
 
         if (adj_lots == 0) [[unlikely]] continue;
 
+        // native exchange lots -> canonical (ctx.reference_lot_size) lots, so
+        // greedy_fill's remaining_lots bookkeeping is apples-to-apples even
+        // when active exchanges quote different lot sizes for the same instrument.
+        const qty_t canonical_lots = static_cast<qty_t>(
+            std::round(static_cast<double>(adj_lots) * c.lot_ratio));
+        if (canonical_lots == 0) [[unlikely]] continue;
+
         CostSlice& s      = ws.slices[ws.slice_count++];
         s.effective_ticks  = best_eff;
-        s.available_lots   = adj_lots;
+        s.available_lots   = canonical_lots;
         s.raw_price_ticks  = pt;
         s.exchange_id      = c.state->exchange_id;
         s.level_idx        = lvl_idx;
@@ -178,8 +194,10 @@ SplitResult RoutingEngine::greedy_fill(
     result.child_count = 0;
     result.filled_qty  = 0.0;
 
+    const double ref_lot_size = resolve_reference_lot_size(ctx);
+
     if (ws.slice_count == 0) [[unlikely]] {
-        result.unfilled_qty = from_lots(ctx.target_lots, ctx.states[0].lot.lot_size);
+        result.unfilled_qty = from_lots(ctx.target_lots, ref_lot_size);
         return result;
     }
 
@@ -200,14 +218,19 @@ SplitResult RoutingEngine::greedy_fill(
 
         // TODO: move min_lots into CostSlice to avoid this division per fill.
         // fine for now, it's not the comparison inner loop.
+        //
+        // slice.available_lots (and therefore fill_lots) is already in canonical
+        // units, so min_lots has to be too: convert the real-world min_qty
+        // directly through ref_lot_size instead of this exchange's native one.
         const qty_t min_lots = static_cast<qty_t>(
-            std::round(state.lot.min_qty / state.lot.lot_size));
+            std::round(state.lot.min_qty / ref_lot_size));
         if (fill_lots < min_lots) [[unlikely]] continue;
 
-        // from here on: double conversions for reporting only
+        // from here on: double conversions for reporting only.
+        // price stays native (tick_sz), qty converts through the canonical
+        // unit since fill_lots is canonical, not this exchange's native lots.
         const double tick_sz   = state.book.tick_size;
-        const double lot_sz    = state.book.lot_size;
-        const double fill_qty  = static_cast<double>(fill_lots) * lot_sz;
+        const double fill_qty  = static_cast<double>(fill_lots) * ref_lot_size;
         const double raw_price = static_cast<double>(slice.raw_price_ticks) * tick_sz;
         const double eff_price = static_cast<double>(slice.effective_ticks)  * tick_sz;
         const double eff_cost  = fill_qty * eff_price;
@@ -234,7 +257,7 @@ SplitResult RoutingEngine::greedy_fill(
     }
 
     result.success      = (remaining_lots == 0);
-    result.unfilled_qty = from_lots(remaining_lots, ctx.states[0].lot.lot_size);
+    result.unfilled_qty = from_lots(remaining_lots, ref_lot_size);
 
     if (result.filled_qty > 1e-9) {
         result.avg_effective_price   = result.total_effective_cost / result.filled_qty;
