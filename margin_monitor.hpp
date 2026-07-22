@@ -4,7 +4,7 @@
 //
 // layer 1 (fast): local estimate updated on every fill and open order change.
 //   computed from: known positions × mark price × margin rate.
-//   latency: zero — happens inline in the execution thread.
+//   latency: zero, happens inline in the execution thread.
 //   accuracy: good in normal conditions, drifts if mark price moves fast.
 //
 // layer 2 (authoritative): REST response from the exchange.
@@ -12,8 +12,7 @@
 //   accuracy: ground truth.
 //
 // the risk engine uses the more conservative of the two.
-// if the local estimate says "no margin" we block even if the REST says ok —
-// REST data could be stale. if REST says "no margin" we block regardless.
+// if the local estimate says "no margin" we block even if the REST says ok, // REST data could be stale. if REST says "no margin" we block regardless.
 //
 // margin_rate: fraction of notional required as margin. 0.1 = 10x leverage.
 
@@ -45,7 +44,7 @@ public:
         local_equity_.store(cfg_.equity_usd, std::memory_order_relaxed);
     }
 
-    // called by execution thread on every fill — keeps local estimate current
+    // called by execution thread on every fill, keeps local estimate current
     void on_fill(qty_t fill_lots, double fill_price_usd, double lot_size) noexcept {
         const double notional = static_cast<double>(fill_lots) * lot_size * fill_price_usd;
         const double margin_delta = notional * cfg_.initial_margin_rate;
@@ -56,7 +55,7 @@ public:
         recompute_available();
     }
 
-    // called when a child is canceled/rejected — releases reserved margin
+    // called when a child is canceled/rejected, releases reserved margin
     void on_release(qty_t lots, double price_usd, double lot_size) noexcept {
         const double notional     = static_cast<double>(lots) * lot_size * price_usd;
         const double margin_delta = notional * cfg_.initial_margin_rate;
@@ -71,7 +70,7 @@ public:
     void on_rest_update(double equity_usd, double used_margin_usd,
                         uint64_t ts_ns) noexcept {
         local_equity_.store(equity_usd, std::memory_order_relaxed);
-        // REST is authoritative — override our local locked estimate
+        // REST is authoritative, override our local locked estimate
         locked_margin_.store(used_margin_usd, std::memory_order_release);
         rest_update_ns_.store(ts_ns, std::memory_order_relaxed);
         recompute_available();
@@ -81,7 +80,7 @@ public:
                    equity_usd - used_margin_usd, (unsigned long)ts_ns);
     }
 
-    // mark price update — recalculates unrealised PnL effect on available margin.
+    // mark price update, recalculates unrealised PnL effect on available margin.
     // called by feed handler thread.
     void on_mark_price(double mark_usd, double lot_size, instr_id_t instr_id) noexcept {
         const auto& instr  = pos_.instruments[instr_id];
@@ -102,7 +101,7 @@ public:
         }
     }
 
-    // used by PreTradeRiskEngine — returns the conservative (lower) estimate
+    // used by PreTradeRiskEngine, returns the conservative (lower) estimate
     [[nodiscard]] double available_conservative() const noexcept {
         return pos_.margin.available();
     }
