@@ -7,10 +7,10 @@
 // is readable without tooling.
 //
 // severity:
-//   ERROR  — risk reject, pool exhaustion, queue full. always to stderr too.
-//   WARN   — partial fill, reroute triggered, stale margin data.
-//   INFO   — order lifecycle: new, fill, cancel, reject.
-//   DEBUG  — SOR slice counts, cursor state, dispatch detail.
+//   ERROR, risk reject, pool exhaustion, queue full. always to stderr too.
+//   WARN, partial fill, reroute triggered, stale margin data.
+//   INFO, order lifecycle: new, fill, cancel, reject.
+//   DEBUG, SOR slice counts, cursor state, dispatch detail.
 
 #include "oms_types.hpp"
 #include <atomic>
@@ -25,7 +25,7 @@ namespace oms {
 
 enum class LogLevel : uint8_t { DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3 };
 
-// fixed-size log entry — no heap, no std::string, no dynamic anything.
+// fixed-size log entry, no heap, no std::string, no dynamic anything.
 struct alignas(kCacheLine) LogEntry {
     static constexpr uint32_t kMsgLen = 184;
 
@@ -67,7 +67,7 @@ public:
     ~AsyncLogger() noexcept { shutdown(); }
 
     // hot path: format into the ring entry, release to the drain thread.
-    // if the ring is full we drop and count it — no blocking, ever.
+    // if the ring is full we drop and count it, no blocking, ever.
     template<typename... Args>
     void log(LogLevel level, const char* fmt, Args&&... args) noexcept {
         const uint32_t h      = head_.load(std::memory_order_relaxed);
@@ -126,7 +126,7 @@ private:
 
             const uint32_t t = tail_.load(std::memory_order_relaxed);
             if (t == head_.load(std::memory_order_acquire)) {
-                // nothing to drain — yield so we don't eat a core
+                // nothing to drain, yield so we don't eat a core
                 std::this_thread::yield();
                 continue;
             }
