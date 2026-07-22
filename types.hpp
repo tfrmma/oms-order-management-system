@@ -55,7 +55,7 @@ struct ChildOrder {
 };
 static_assert(sizeof(ChildOrder) == 32);
 
-// all three 64-bit fields are integer — FPU doesn't touch this during merge or fill.
+// all three 64-bit fields are integer, FPU doesn't touch this during merge or fill.
 // double conversions happen when we write ChildOrder, i.e. when the decision is done.
 //
 // effective_ticks encoding:
