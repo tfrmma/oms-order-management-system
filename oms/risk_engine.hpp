@@ -39,8 +39,12 @@ public:
             return RiskRejectReason::FAT_FINGER;
         if (check_position(sig)   != RiskRejectReason::OK) [[unlikely]]
             return RiskRejectReason::POSITION_LIMIT;
-        if (check_margin(sig)     != RiskRejectReason::OK) [[unlikely]]
-            return RiskRejectReason::MARGIN;
+
+        // check_margin() returns NOTIONAL or MARGIN depending on which limit
+        // tripped, propagate it as-is instead of collapsing both to MARGIN
+        const RiskRejectReason margin_result = check_margin(sig);
+        if (margin_result != RiskRejectReason::OK) [[unlikely]]
+            return margin_result;
         return RiskRejectReason::OK;
     }
 
