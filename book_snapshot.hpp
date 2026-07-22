@@ -10,12 +10,13 @@
 // book_imbalance: signed bid/ask qty imbalance [-1, +1].
 //   +1 = all bids (buy pressure), -1 = all asks (sell pressure).
 //
-// atomic<double> pairs are slightly ugly but correct — each field is
+// atomic<double> pairs are slightly ugly but correct, each field is
 // independently consistent. if you need joint consistency across vol+imb,
 // use a seqlock instead. for now the approximation is fine.
 
 #include "oms_types.hpp"
 #include "sor/types.hpp"
+#include "logger.hpp"
 #include <atomic>
 #include <array>
 #include <cstdint>
@@ -36,7 +37,7 @@ struct alignas(kCacheLine) ExchangeSnapshot {
         last_update_ns.store(ts_ns, std::memory_order_release);
     }
 
-    // execution thread reads this — acquire pairs with the release above
+    // execution thread reads this, acquire pairs with the release above
     struct Reading {
         double   vol_factor;
         double   book_imbalance;
@@ -66,7 +67,7 @@ static_assert(alignof(ExchangeSnapshot) == kCacheLine);
 struct BookSnapshotCache {
     std::array<ExchangeSnapshot, sor::kMaxExchanges> exchanges{};
 
-    // returns vol/imbalance for routing — uses the freshest available snapshot.
+    // returns vol/imbalance for routing, uses the freshest available snapshot.
     // if all are stale, falls back to 0/0 (conservative: no vol/imb penalty).
     struct RoutingInputs {
         double   short_vol_factor{0.0};
@@ -87,14 +88,14 @@ struct BookSnapshotCache {
             if (r.fresh && r.ts_ns > best_ts) {
                 best_ts   = r.ts_ns;
                 best_vol  = r.vol_factor;
-                // flip sign for SELL — imbalance leaning against us
+                // flip sign for SELL, imbalance leaning against us
                 best_imb  = (dir == sor::OrderDir::BUY) ? r.book_imbalance : -r.book_imbalance;
                 any_fresh = true;
             }
         }
 
         if (!any_fresh) {
-            g_log.warn("BOOK_SNAPSHOT  ALL_STALE  using_zero_vol_imb");
+            g_log.warn("%s", "BOOK_SNAPSHOT  ALL_STALE  using_zero_vol_imb");
         }
 
         return { best_vol, best_imb, any_fresh };
