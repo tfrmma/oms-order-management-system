@@ -1,7 +1,7 @@
 // OMS integration demo. Same 5-exchange setup as the SOR example.
 // Shows the full path: strategy signal -> risk check -> SOR -> dispatch -> fills.
 //
-// Single-threaded for demo purposes — in production the queues connect to
+// Single-threaded for demo purposes, in production the queues connect to
 // separate strategy, execution, and gateway threads.
 
 #include "execution_core.hpp"
@@ -63,7 +63,7 @@ int main() {
     fees.rates[3][0] =  0.0000; fees.rates[3][1] =  0.0003;
     fees.rates[4][0] =  0.0002; fees.rates[4][1] =  0.0006;
 
-    // logger first — before anything can go wrong
+    // logger first, before anything can go wrong
     g_log.init("oms.log");
     g_log.info("DEMO_START  exchanges=%u", kMaxExchanges);
 
@@ -74,7 +74,7 @@ int main() {
     populate_mock_exchange(states[3], 3, 65097.5, 0.5, 0.15, 820.0, fees);
     populate_mock_exchange(states[4], 4, 65102.0, 0.5, 0.30, 260.0, fees);
 
-    // these are ~83KB together — too big for the stack in some environments
+    // these are ~83KB together, too big for the stack in some environments
     static GatewayQueue<OutboundOrder> gw_queues[kMaxExchanges];
 
     ExecCoreConfig cfg{};
@@ -104,7 +104,7 @@ int main() {
     cfg.dashboard.refresh_ms      = 250;
     cfg.dashboard.instr_id        = 0;
 
-    // ExecutionCore is ~2.6MB (order pool) — allocate it properly, not on the stack.
+    // ExecutionCore is ~2.6MB (order pool), allocate it properly, not on the stack.
     // In production this lives as a member of the execution thread object.
     auto core_ptr = std::make_unique<ExecutionCore>(cfg);
     ExecutionCore& core = *core_ptr;
@@ -136,7 +136,7 @@ int main() {
 
     std::cout << std::fixed << std::setprecision(4);
     std::cout << "══════════════════════════════════════════════════════════\n";
-    std::cout << "  OMS — BUY 5 BTC across " << kMaxExchanges << " exchanges\n";
+    std::cout << "  OMS: BUY 5 BTC across " << kMaxExchanges << " exchanges\n";
     std::cout << "══════════════════════════════════════════════════════════\n";
     std::cout << "  Risk:     PASSED\n";
     std::cout << "  Children: " << snap_count << "\n";
@@ -187,4 +187,3 @@ int main() {
 
     return (core.pool().parents_in_use() == 0) ? 0 : 1;
 }
-// intentionally left blank
