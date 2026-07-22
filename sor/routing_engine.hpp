@@ -50,6 +50,7 @@ private:
         const LevelSide*     levels;
         double               tick_size;
         double               lot_size;
+        double               lot_ratio;     // native lot_size / ctx.reference_lot_size
         double               fill_rate;
         int64_t              penalty_ticks;
         int64_t              dir_sign;
@@ -64,6 +65,10 @@ private:
     // advance to the next level that clears limit_ticks + min_lots checks.
     // for sorted sides, a limit violation means all deeper levels also fail → exhaust.
     static void seek_next_valid(Cursor& c) noexcept;
+
+    // ctx.reference_lot_size, or states[0]'s native lot_size if unset. both
+    // build_cost_slices and greedy_fill need this so it lives in one place.
+    static double resolve_reference_lot_size(const RoutingContext& ctx) noexcept;
 
     static double estimate_fill_rate(
         double rtt_us, double vol_factor, double directional_imb) noexcept;
