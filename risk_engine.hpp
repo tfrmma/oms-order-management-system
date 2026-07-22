@@ -1,7 +1,7 @@
 #pragma once
 
 // pre-trade risk. inline reads against in-memory tables.
-// must stay under ~200ns — it runs on every order before touching the SOR.
+// must stay under ~200ns, it runs on every order before touching the SOR.
 
 #include "oms_types.hpp"
 #include "position_tracker.hpp"
