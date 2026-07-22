@@ -11,8 +11,8 @@
 #include "timer_wheel.hpp"
 #include "book_snapshot.hpp"
 #include "margin_monitor.hpp"
-#include "routing_engine.hpp"
-#include "exchange_state.hpp"
+#include "sor/routing_engine.hpp"
+#include "sor/exchange_state.hpp"
 
 namespace oms {
 
