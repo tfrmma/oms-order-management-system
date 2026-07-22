@@ -2,29 +2,31 @@
 
 Smart Order Router with an institutional OMS layer on top.
 
-The SOR was already fast (1–3 µs, zero heap, integer-only hot path). The OMS wraps it without ruining that — same constraints: no heap on the critical path, `alignas(64)` everywhere, SPSC queues between threads, pre-trade risk in ~100 ns.
+The SOR was already fast (1–3 µs, zero heap, integer-only hot path). The OMS wraps it without ruining that, same constraints: no heap on the critical path, `alignas(64)` everywhere, SPSC queues between threads, pre-trade risk in ~100 ns.
 
 ---
 
 ## Files
 
-**SOR**
-- `types.hpp` — integer price/qty types, constants, `ChildOrder`, `SplitResult`
-- `normalized_book.hpp` — SoA order book, precomputed cumulative qty
-- `exchange_state.hpp` — `LatencyTracker` (EWMA + vol/imbalance penalty), `LotConstraints`
-- `routing_engine.hpp/cpp` — the SOR: K-way merge → greedy fill
+**SOR** (`sor/`)
+- `sor/types.hpp`: integer price/qty types, constants, `ChildOrder`, `SplitResult`
+- `sor/normalized_book.hpp`: SoA order book, precomputed cumulative qty
+- `sor/exchange_state.hpp`: `LatencyTracker` (EWMA + vol/imbalance penalty), `LotConstraints`
+- `sor/routing_engine.hpp/cpp`: the SOR, K-way merge to greedy fill
 
-**OMS**
-- `oms_types.hpp` — signals, reports, enums, `Result<T>`
-- `order_pool.hpp` — `ParentOrder`, `ChildOrderState`, `OMSOrderPool` (flat pre-alloc)
-- `position_tracker.hpp` — `InstrumentPosition` (signed net), `MarginState` (async update)
-- `risk_engine.hpp` — `PreTradeRiskEngine`: fat-finger, position limit, notional, margin
-- `spsc_queue.hpp` — SPSC ring buffer, `GatewayQueue`/`InboundQueue` aliases, `OutboundOrder`
-- `execution_core.hpp/cpp` — `ExecutionCore`: main loop, order lifecycle, rerouting
+**OMS** (`oms/`)
+- `oms/oms_types.hpp`: signals, reports, enums, `Result<T>`
+- `oms/order_pool.hpp`: `ParentOrder`, `ChildOrderState`, `OMSOrderPool` (flat pre-alloc)
+- `oms/position_tracker.hpp`: `InstrumentPosition` (signed net), `MarginState` (async update)
+- `oms/risk_engine.hpp`: `PreTradeRiskEngine`, fat-finger, position limit, notional, margin
+- `oms/spsc_queue.hpp`: SPSC ring buffer, `GatewayQueue`/`InboundQueue` aliases, `OutboundOrder`
+- `oms/logger.hpp`, `oms/margin_monitor.hpp`, `oms/notional_gate.hpp`, `oms/book_snapshot.hpp`, `oms/timer_wheel.hpp`: supporting OMS components
+- `oms/execution_core.hpp/cpp`: `ExecutionCore`, main loop, order lifecycle, rerouting
+- `oms/dashboard.hpp`: **referenced by `execution_core.hpp` but not present in this repo, see note below**
 
 **Examples**
-- `main_example.cpp` — standalone SOR demo
-- `oms_example.cpp` — full OMS pipeline demo
+- `main_example.cpp`: standalone SOR demo
+- `oms_example.cpp`: full OMS pipeline demo
 
 ---
 
@@ -32,11 +34,11 @@ The SOR was already fast (1–3 µs, zero heap, integer-only hot path). The OMS 
 
 Three phases, all on the stack:
 
-1. **Build** — one `Cursor` per exchange. Per-cursor cost = taker fee + dynamic latency penalty (EWMA RTT scaled by vol and book imbalance). Penalty expressed as integer tick offset so the merge loop is pure integer.
+1. **Build**: one `Cursor` per exchange. Per-cursor cost = taker fee + dynamic latency penalty (EWMA RTT scaled by vol and book imbalance). Penalty expressed as integer tick offset so the merge loop is pure integer.
 
-2. **Merge** — K-way merge of the K sorted book sides. Linear scan across K=5 cursors per step, not a heap. At K=5 the linear scan wins.
+2. **Merge**: K-way merge of the K sorted book sides. Linear scan across K=5 cursors per step, not a heap. At K=5 the linear scan wins.
 
-3. **Fill** — greedy sweep over the sorted slices. Monotonic effective prices make greedy provably optimal here. Integer throughout until the fill decision is made, then doubles for reporting.
+3. **Fill**: greedy sweep over the sorted slices. Monotonic effective prices make greedy provably optimal here. Integer throughout until the fill decision is made, then doubles for reporting.
 
 Result: 11 child orders for a 5 BTC BUY across 5 exchanges, p99 under 2 µs.
 
@@ -60,15 +62,15 @@ StrategyOrderSignal  →  PreTradeRiskEngine  →  OMSOrderPool (alloc parent)
 
 Single execution thread, busy-spinning. Two inbound SPSC queues (strategy signals, execution reports). One outbound queue per exchange gateway thread.
 
-`OMSOrderPool` is ~2.8 MB (4096 parents + 32768 children). It lives on the heap or in `.bss` — never on the stack. O(1) alloc/free via LIFO free lists. Access by ID is a direct array index.
+`OMSOrderPool` is ~2.8 MB (4096 parents + 32768 children). It lives on the heap or in `.bss`, never on the stack. O(1) alloc/free via LIFO free lists. Access by ID is a direct array index.
 
 ---
 
 ## Build
 
 ```bash
-git clone https://github.com/tfrmma/sor-engine.git
-cd sor-engine
+git clone https://github.com/tfrmma/oms-order-management-system.git
+cd oms-order-management-system
 
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
@@ -105,7 +107,7 @@ cfg.risk_limits.max_order_lots[BTC_PERP] = to_lots(10.0, 0.001);
 cfg.risk_limits.max_net_lots[BTC_PERP]   = to_lots(50.0, 0.001);
 cfg.risk_limits.max_notional_usd         = 500'000.0;
 
-// ~2.8 MB — don't put it on the stack
+// ~2.8 MB, don't put it on the stack
 auto core = std::make_unique<ExecutionCore>(cfg);
 
 std::thread exec_thread([&]{ core->run(); });
@@ -149,6 +151,8 @@ Constants were calibrated against internal fill data. Recalibrate for your excha
 
 ## Known limitations / TODO
 
+- **Build-blocking gap:** `oms/execution_core.hpp` includes `dashboard.hpp` and uses `Dashboard`/`DashboardConfig` (constructed in `ExecutionCore`, started in `execution_core.cpp`, configured in `oms_example.cpp`), but `dashboard.hpp` is not present anywhere in this repo. `oms_lib`/`oms_example`/`oms_tests` will not compile until it's added.
+- **Build-blocking gap:** `CMakeLists.txt` references `tests/catch_amalgamated.cpp` and `tests/test_oms.cpp` (Catch2 test suite) for the `oms_tests` target, but the `tests/` directory doesn't exist in this repo.
 - No cancel-on-timeout. Child orders with no ack sit in `PENDING_NEW` indefinitely. Needs a timer wheel keyed by `sent_ns`.
 - Pool exhaustion drops the signal silently. Should push a reject back to the strategy queue.
 - Lot size hardcoded to 0.001 in the notional check and VWAP. Needs an instrument table.
