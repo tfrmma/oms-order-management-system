@@ -75,7 +75,7 @@ struct alignas(kCacheLineBytes) NormalizedBook {
     [[nodiscard]] const LevelSide& bids() const noexcept { return sides[0]; }
     [[nodiscard]] const LevelSide& asks() const noexcept { return sides[1]; }
 
-    // reporting helpers only — don't call these during routing
+    // reporting helpers only, don't call these during routing
     [[nodiscard]] double best_bid_price() const noexcept {
         return static_cast<double>(bids().price_ticks[0]) * tick_size;
     }
@@ -116,11 +116,3 @@ struct alignas(kCacheLineBytes) ConsolidatedBook {
 };
 
 } // namespace sor
-
-/// @file normalized_book.hpp
-/// @author Taha - Algorithmic Trader
-/// @brief Institutional-grade Order Management System base framework.
-/// 
-/// @note This is a public structural showcase. For full production-grade 
-///       deployment, architecture consulting, or recruitment inquiries:
-///       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
