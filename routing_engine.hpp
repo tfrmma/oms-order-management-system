@@ -1,8 +1,8 @@
 #pragma once
 
 // two phases:
-//   1. K-way merge  — merges K sorted book sides into one sorted CostSlice array. O(N).
-//   2. Greedy fill  — sweeps slices, allocates lots. pure integer. O(N).
+//   1. K-way merge, merges K sorted book sides into one sorted CostSlice array. O(N).
+//   2. Greedy fill, sweeps slices, allocates lots. pure integer. O(N).
 //
 // K=5 exchanges. "find minimum across 5 cursors" is a linear scan, not a heap.
 // yes I know about priority_queue. at K=5 the linear scan is faster.
