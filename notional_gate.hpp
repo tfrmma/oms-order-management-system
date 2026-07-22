@@ -4,7 +4,7 @@
 //
 // before any order hits the SOR, this computes the USD value at stake and
 // either auto-approves (below threshold) or blocks and asks for explicit
-// confirmation. blocking call — intentional. if the notional is large enough
+// confirmation. blocking call, intentional. if the notional is large enough
 // to need a confirmation, a few milliseconds of human latency is irrelevant.
 //
 // in production you'd wire this to a dedicated confirmation terminal or a
@@ -35,7 +35,7 @@ public:
     // blocks on confirmation if notional > auto_approve_usd.
     [[nodiscard]] bool approve(const StrategyOrderSignal& sig) noexcept {
         if (sig.limit_price_usd <= 0.0) {
-            // market order — no notional cap possible, log and pass
+            // market order, no notional cap possible, log and pass
             g_log.warn("NOTIONAL_GATE  market_order  instr=%u  qty_lots=%ld  NO_LIMIT",
                        (unsigned)sig.instr_id, (long)sig.qty_lots);
             return true;
@@ -57,7 +57,7 @@ public:
             return true;
         }
 
-        // above threshold — need explicit confirmation
+        // above threshold, need explicit confirmation
         return prompt_confirmation(dir_str, notional, sig);
     }
 
@@ -106,7 +106,7 @@ private:
                    dir_str, notional, buf);
 
         if (approved) {
-            std::fprintf(stderr, "  ✓ Order approved — %.2f USD in play\n\n", notional);
+            std::fprintf(stderr, "  ✓ Order approved, %.2f USD in play\n\n", notional);
         } else {
             std::fprintf(stderr, "  ✗ Order rejected by operator\n\n");
         }
@@ -124,7 +124,7 @@ private:
             "  ║  Direction   : %-34s║\n"
             "  ║  Notional    : %-12.2f USD                     ║\n"
             "  ║  Hard limit  : %-12.2f USD                     ║\n"
-            "  ║  Status      : ORDER BLOCKED — NOT SENT          ║\n"
+            "  ║  Status      : ORDER BLOCKED, NOT SENT          ║\n"
             "  ╚══════════════════════════════════════════════════╝\n\n",
             dir_str, notional, cfg_.hard_block_usd
         );
