@@ -1,6 +1,7 @@
 #include "execution_core.hpp"
 
 #include <cassert>
+#include <cmath>
 #include <cstring>
 
 static inline uint64_t now_ns() noexcept {
@@ -162,8 +163,9 @@ void ExecutionCore::dispatch_child_orders(ParentOrder&                 parent,
                                           const sor::ChildOrderBuffer& buf,
                                           const sor::RoutingContext&   ctx) noexcept {
     const uint64_t ts = now_ns();
+    uint32_t i = 0;
 
-    for (uint32_t i = 0; i < buf.count; ++i) {
+    for (; i < buf.count; ++i) {
         if (parent.child_count >= ParentOrder::kMaxChildrenPerParent) [[unlikely]]
             break;
 
@@ -172,10 +174,6 @@ void ExecutionCore::dispatch_child_orders(ParentOrder&                 parent,
         if (!cid_res.ok) [[unlikely]] {
             g_log.error("CHILD_POOL_EXHAUSTED  parent_id=%u  dispatched=%u  of=%u  total_failures=%lu",
                 parent.parent_id, i, buf.count, (unsigned long)pool_.child_alloc_failures());
-            // TODO: parent.leaves_qty_lots and pos_.reserve_open() above both
-            // assume the full sig.qty_lots got dispatched. if we stop short
-            // here, they're now out of sync with what's actually working at
-            // the exchange, nothing currently reconciles that gap.
             break;
         }
 
@@ -220,6 +218,43 @@ void ExecutionCore::dispatch_child_orders(ParentOrder&                 parent,
             (void)cfg_.gateways[ex].outbound->push(out);
         // push failure = queue full = order lost. cancel-on-timeout will catch it.
         // TODO: handle this properly
+    }
+
+    if (i < buf.count) [[unlikely]] {
+        // buf.orders[i..count) never made it out. co.qty is already expressed
+        // in this ctx's canonical unit (see sor::RoutingEngine's reference_lot_size),
+        // same unit parent.leaves_qty_lots uses, so summing it directly and
+        // converting once is correct even if the undispatched legs were headed
+        // to exchanges with different native lot sizes.
+        double gap_qty = 0.0;
+        for (uint32_t j = i; j < buf.count; ++j) gap_qty += buf.orders[j].qty;
+
+        const double ref_lot_size = sor::RoutingEngine::resolve_reference_lot_size(ctx);
+        const qty_t  gap_lots     = static_cast<qty_t>(std::round(gap_qty / ref_lot_size));
+
+        if (gap_lots > 0) {
+            // this portion never reached an exchange, it was never really "at
+            // risk", release the margin reserve_open() took for it upfront.
+            // parent.leaves_qty_lots is untouched on purpose: it's derived from
+            // total_qty_lots - cum_qty_lots and already correctly counts this
+            // gap as still outstanding, which is what lets it get picked up by
+            // a later reroute_leaves() instead of vanishing.
+            pos_.instruments[parent.instr_id].release_open(parent.dir, gap_lots);
+            g_log.error("DISPATCH_GAP  parent_id=%u  dispatched=%u  of=%u  gap_lots=%ld  margin_released",
+                parent.parent_id, i, buf.count, (long)gap_lots);
+        }
+    }
+
+    if (parent.child_count == 0) [[unlikely]] {
+        // nothing at all made it out, this parent will never receive another
+        // execution report (no children exist to report on), so nobody will
+        // ever come back to close it out. handle it here instead of leaving
+        // it stuck in PENDING_NEW/PARTIALLY_FILLED forever.
+        g_log.error("DISPATCH_EMPTY  parent_id=%u  leaves_lots=%ld  cum_qty_lots=%ld",
+            parent.parent_id, (long)parent.leaves_qty_lots, (long)parent.cum_qty_lots);
+        parent.state = (parent.cum_qty_lots > 0) ? OrderState::PARTIALLY_FILLED
+                                                  : OrderState::REJECTED;
+        pool_.free_parent(parent.parent_id);
     }
 }
 
@@ -293,6 +328,14 @@ void ExecutionCore::handle_fill(ChildOrderState&       child,
         g_log.debug("PARENT_PARTIAL  parent_id=%u  leaves_lots=%ld",
             parent.parent_id, (long)parent.leaves_qty_lots);
         parent.state = OrderState::PARTIALLY_FILLED;
+
+        // normally there's still a PENDING_NEW sibling child out there that'll
+        // eventually report back and re-trigger this check. but if every child
+        // this parent currently has is already terminal (e.g. some of them
+        // never got dispatched in the first place, see DISPATCH_GAP), nothing
+        // else is coming, this is the only chance to pick the remainder back up.
+        if (all_children_terminal(parent))
+            reroute_leaves(parent);
     }
 }
 
@@ -360,9 +403,14 @@ void ExecutionCore::reroute_leaves(ParentOrder& parent) noexcept {
     sor_.calculate_optimal_split(routing_ctx_, child_buf_);
 
     if (child_buf_.count == 0) [[unlikely]] {
-        g_log.error("REROUTE_NO_LIQUIDITY  parent_id=%u  leaves_lots=%ld  PARKED_AS_PARTIAL",
-            parent.parent_id, (long)parent.leaves_qty_lots);
-        parent.state = OrderState::PARTIALLY_FILLED;
+        // same situation as DISPATCH_EMPTY in dispatch_child_orders: zero
+        // children means zero future execution reports, so this is the last
+        // chance to close this parent out instead of parking it forever.
+        g_log.error("REROUTE_NO_LIQUIDITY  parent_id=%u  leaves_lots=%ld  cum_qty_lots=%ld",
+            parent.parent_id, (long)parent.leaves_qty_lots, (long)parent.cum_qty_lots);
+        parent.state = (parent.cum_qty_lots > 0) ? OrderState::PARTIALLY_FILLED
+                                                  : OrderState::REJECTED;
+        pool_.free_parent(parent.parent_id);
         return;
     }
 
