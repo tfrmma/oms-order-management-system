@@ -33,6 +33,12 @@ public:
         ChildOrderBuffer&     out
     ) noexcept;
 
+    // ctx.reference_lot_size, or states[0]'s native lot_size if unset. public
+    // because ExecutionCore needs the exact same resolution when it converts
+    // a real-world qty gap (e.g. an undispatched child) back into the
+    // canonical lots that ParentOrder::leaves_qty_lots is expressed in.
+    static double resolve_reference_lot_size(const RoutingContext& ctx) noexcept;
+
 private:
     // one cursor per exchange. all the per-exchange scalars are precomputed here
     // so the inner merge loop only does: dir_sign * price_ticks + penalty_ticks.
@@ -65,10 +71,6 @@ private:
     // advance to the next level that clears limit_ticks + min_lots checks.
     // for sorted sides, a limit violation means all deeper levels also fail → exhaust.
     static void seek_next_valid(Cursor& c) noexcept;
-
-    // ctx.reference_lot_size, or states[0]'s native lot_size if unset. both
-    // build_cost_slices and greedy_fill need this so it lives in one place.
-    static double resolve_reference_lot_size(const RoutingContext& ctx) noexcept;
 
     static double estimate_fill_rate(
         double rtt_us, double vol_factor, double directional_imb) noexcept;
