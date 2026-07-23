@@ -15,6 +15,7 @@
 #include "risk_engine.hpp"
 #include "spsc_queue.hpp"
 #include "timer_wheel.hpp"
+#include "execution_core.hpp"
 
 #include <vector>
 
@@ -194,6 +195,43 @@ TEST_CASE("RoutingEngine: SELL fills against bids highest-price-first") {
     REQUIRE(out.orders[0].dir   == OrderDir::SELL);
 }
 
+TEST_CASE("RoutingEngine: reference_lot_size reconciles exchanges with different native lot sizes") {
+    // exchange 0 quotes in 1.0-unit lots, exchange 1 quotes the same instrument
+    // in 2.0-unit lots (e.g. an inverse contract). without reference_lot_size,
+    // "10 lots" on exchange 1 would get treated as 10 real units instead of the
+    // 20 it actually represents, corrupting the remaining_lots bookkeeping.
+    ExchangeState ex[2]{};
+    init_exchange(ex[0], 0);
+    init_exchange(ex[1], 1);
+    ex[1].book.lot_size = 2.0;
+    ex[1].lot.lot_size  = 2.0;
+    set_levels(ex[0].book.asks(), {{100, 10}});  // 10 real units
+    set_levels(ex[1].book.asks(), {{100, 10}});  // 10 native lots = 20 real units, same price
+
+    FeeMatrix fees{};
+    RoutingEngine engine(fees);
+    ChildOrderBuffer out;
+    RoutingContext ctx = make_context(ex, 2, OrderDir::BUY, 25);
+    ctx.reference_lot_size = 1.0;  // canonical unit: 1 real unit
+
+    const SplitResult r = engine.calculate_optimal_split(ctx, out);
+
+    REQUIRE(r.success);
+    REQUIRE(r.child_count == 2);
+    // exchange 0 exhausts its 10 real units first (tied price, scanned first)
+    REQUIRE(out.orders[0].exchange_id == 0);
+    REQUIRE(out.orders[0].qty         == Catch::Approx(10.0));
+    // exchange 1 covers the remaining 15 real units out of its 20 available,
+    // not "15 native lots" (which would be 30 real units) and not capped at
+    // its raw qty_lots figure of 10 (which would under-fill and misreport)
+    REQUIRE(out.orders[1].exchange_id == 1);
+    REQUIRE(out.orders[1].qty         == Catch::Approx(15.0));
+
+    // filled_qty must equal target exactly, never exceed it
+    REQUIRE(r.filled_qty   == Catch::Approx(25.0));
+    REQUIRE(r.unfilled_qty == Catch::Approx(0.0));
+}
+
 TEST_CASE("OMSOrderPool: alloc/free is LIFO") {
     OMSOrderPool pool;
     REQUIRE(pool.parents_in_use() == 0);
@@ -231,6 +269,33 @@ TEST_CASE("OMSOrderPool: exhausts cleanly and recovers after freeing everything"
 
     for (const auto id : ids) pool.free_parent(id);
     REQUIRE(pool.parents_in_use() == 0);
+}
+
+TEST_CASE("OMSOrderPool: alloc failures are counted, not just dropped") {
+    OMSOrderPool pool;
+    REQUIRE(pool.parent_alloc_failures() == 0);
+    REQUIRE(pool.child_alloc_failures()  == 0);
+
+    std::vector<order_id_t> ids;
+    ids.reserve(kMaxParentOrders);
+    for (uint32_t i = 0; i < kMaxParentOrders; ++i)
+        ids.push_back(pool.alloc_parent().value);
+
+    // three failed allocs on top of a full pool -> three counted failures,
+    // regardless of how many succeeded before it filled up
+    REQUIRE_FALSE(pool.alloc_parent().ok);
+    REQUIRE_FALSE(pool.alloc_parent().ok);
+    REQUIRE_FALSE(pool.alloc_parent().ok);
+    REQUIRE(pool.parent_alloc_failures() == 3);
+    REQUIRE(pool.child_alloc_failures()  == 0);  // independent counters, child pool untouched
+
+    for (const auto id : ids) pool.free_parent(id);
+
+    // freeing capacity doesn't reset the cumulative counter, it's "since
+    // process start", not "currently exhausted"
+    REQUIRE(pool.parent_alloc_failures() == 3);
+    REQUIRE(pool.alloc_parent().ok);
+    REQUIRE(pool.parent_alloc_failures() == 3);
 }
 
 TEST_CASE("InstrumentPosition: weighted average price on same-side adds") {
@@ -371,4 +436,138 @@ TEST_CASE("TimerWheel: cancel before the deadline suppresses the callback") {
     wheel.tick(10'000'000ULL);
 
     REQUIRE(fire_count == 0);
+}
+
+// ---------------------------------------------------------------------------
+// ExecutionCore integration: proves the DISPATCH_GAP fix for real, driven
+// through the public API only (on_strategy_order), not by reaching into
+// private state. Deliberately exhausts the real child pool instead of
+// mocking it, kMaxTotalChildren is only 32768 and each filler order eats
+// exactly 16 slots, so this is a few thousand cheap calls, not a stress test.
+// ---------------------------------------------------------------------------
+TEST_CASE("ExecutionCore: undispatched children release their margin reservation") {
+    ExchangeState ex{};
+    init_exchange(ex, 0);
+    // 16 ask levels, 1 lot each: a 16-lot order sweeps all of them, producing
+    // exactly 16 children, exactly ParentOrder::kMaxChildrenPerParent.
+    set_levels(ex.book.asks(), {
+        {100,1},{101,1},{102,1},{103,1},{104,1},{105,1},{106,1},{107,1},
+        {108,1},{109,1},{110,1},{111,1},{112,1},{113,1},{114,1},{115,1}
+    });
+
+    ExecCoreConfig cfg{};
+    cfg.exchange_states  = &ex;
+    cfg.active_exchanges = 1;
+    cfg.risk_limits.max_order_lots[0]  = 100'000;
+    cfg.risk_limits.max_net_lots[0]    = 100'000;
+    cfg.risk_limits.lot_size[0]        = 1.0;
+    cfg.margin.equity_usd              = 1e9;
+    cfg.notional_gate.auto_approve_usd = 1e12;  // market orders skip the gate anyway (limit_price_usd = 0)
+    cfg.dashboard.enabled              = false; // no need for a live snapshot thread in a unit test
+
+    ExecutionCore core(cfg);
+
+    StrategyOrderSignal filler{};
+    filler.instr_id = 0;
+    filler.dir      = OrderDir::BUY;
+    filler.qty_lots = 16;
+
+    // pack the child pool with full 16-child parents, stop with fewer than
+    // 16 slots left so the next 16-lot order can't fully dispatch
+    while (core.pool().children_in_use() + 16 <= kMaxTotalChildren - 11)
+        core.on_strategy_order(filler);
+
+    // top up to exactly 11 free slots with a smaller filler (sweeps only
+    // the first 5 levels), landing on a number that isn't a multiple of 16
+    StrategyOrderSignal small_filler = filler;
+    small_filler.qty_lots = 5;
+    core.on_strategy_order(small_filler);
+
+    const uint32_t used_before    = core.pool().children_in_use();
+    const uint32_t free_before    = kMaxTotalChildren - used_before;
+    const int64_t  open_before    = core.positions().instruments[0].open_buy_lots.load();
+    REQUIRE(free_before < 16);
+    REQUIRE(free_before > 0);
+
+    // this 16-lot order can only get free_before children out the door
+    core.on_strategy_order(filler);
+
+    const uint32_t dispatched = core.pool().children_in_use() - used_before;
+    REQUIRE(dispatched == free_before);   // took exactly what was available, no more
+    REQUIRE(dispatched < 16);             // proves the gap actually happened
+    REQUIRE(dispatched > 0);              // and it wasn't a total failure either
+
+    // the open-order reservation grew by exactly what got dispatched, not by
+    // the full 16 lots the signal asked for, this is the actual fix: before
+    // it, this would still show +16 (the gap's margin leaked, never released)
+    const int64_t open_after = core.positions().instruments[0].open_buy_lots.load();
+    REQUIRE(open_after - open_before == static_cast<int64_t>(dispatched));
+
+    // and the parent itself must not be orphaned: it's still tracked, holding
+    // exactly the children that got dispatched, waiting on those to terminate
+    // so a later reroute can pick up the gap (DISPATCH_GAP doesn't shrink
+    // leaves_qty_lots on purpose, see the comment at the call site)
+    REQUIRE(core.pool().parents_in_use() > 0);
+}
+
+TEST_CASE("ExecutionCore: a parent whose last dispatched child fills still gets rerouted for its gap") {
+    // 20 levels (kMaxDepth), 1 lot each. a 20-lot order needs all of them,
+    // but ParentOrder::kMaxChildrenPerParent (16) caps one dispatch round,
+    // so this always leaves a 4-lot gap without touching the real child
+    // pool's capacity, cheap to set up compared to genuinely exhausting it.
+    ExchangeState ex{};
+    init_exchange(ex, 0);
+    LevelSide& asks = ex.book.asks();
+    for (uint32_t i = 0; i < 20; ++i) {
+        asks.price_ticks[i] = 100 + static_cast<int64_t>(i);
+        asks.qty_lots[i]    = 1;
+    }
+    asks.count = 20;
+    asks.recompute_cumulative();
+
+    ExecCoreConfig cfg{};
+    cfg.exchange_states  = &ex;
+    cfg.active_exchanges = 1;
+    cfg.risk_limits.max_order_lots[0]  = 1000;
+    cfg.risk_limits.max_net_lots[0]    = 1000;
+    cfg.risk_limits.lot_size[0]        = 1.0;
+    cfg.margin.equity_usd              = 1e9;
+    cfg.notional_gate.auto_approve_usd = 1e12;
+    cfg.dashboard.enabled              = false;
+
+    ExecutionCore core(cfg);
+
+    StrategyOrderSignal sig{};
+    sig.instr_id = 0;
+    sig.dir      = OrderDir::BUY;
+    sig.qty_lots = 20;
+
+    core.on_strategy_order(sig);
+    REQUIRE(core.pool().parents_in_use()  == 1);
+    REQUIRE(core.pool().children_in_use() == 16);  // capped, 4-lot gap parked in leaves_qty_lots
+
+    // fill all 16 dispatched children. LIFO alloc on a fresh pool is
+    // deterministic: the only parent this test ever creates is id 0, and its
+    // children were allocated sequentially as ids 0..15.
+    for (child_id_t cid = 0; cid < 16; ++cid) {
+        ExecutionReport rep{};
+        rep.child_id        = cid;
+        rep.exec_type       = ExecType::FILL;
+        rep.exchange_id     = 0;
+        rep.fill_qty_lots   = 1;
+        rep.fill_price_ticks = 100 + static_cast<price_t>(cid);
+        rep.recv_ns          = 1;
+        core.on_execution_report(rep);
+    }
+
+    // without the handle_fill fix: all 16 children are now FILLED and freed,
+    // nothing else will ever generate an execution report for this parent, so
+    // its remaining 4 lots would sit in leaves_qty_lots forever and the parent
+    // pool slot would never free. with the fix, the 16th fill's
+    // all_children_terminal() check (parent.leaves_qty_lots=4, all children
+    // terminal) triggers reroute_leaves(), which dispatches fresh children
+    // for the gap instead.
+    REQUIRE(core.pool().children_in_use() == 4);
+    REQUIRE(core.pool().parents_in_use()  == 1);  // same parent, still tracked, not orphaned
+    REQUIRE(core.positions().instruments[0].net_qty_lots.load() == 16);
 }
