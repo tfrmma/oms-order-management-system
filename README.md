@@ -292,7 +292,10 @@ Covers the SOR merge/fill algorithm (single and multi-exchange, partial
 fills, limit price clipping, BUY/SELL sign handling, mismatched lot sizes
 across exchanges), `OMSOrderPool` alloc/free and failure counting,
 `InstrumentPosition` avg price tracking, `PreTradeRiskEngine` rejection
-paths, `SpscQueue`, and `TimerWheel`.
+paths, `SpscQueue`, `TimerWheel`, and two `ExecutionCore` integration tests
+that drive a real pool to exhaustion through `on_strategy_order` (the public
+API, not a mock) to prove the dispatch-gap margin/reroute fix above actually
+holds end to end.
 
 Built with `-fno-exceptions` like the rest of the project. Catch2
 auto-detects this and switches `REQUIRE` to abort the whole binary on
@@ -370,28 +373,31 @@ Constants were calibrated against internal fill data. Recalibrate for your excha
 
 ## Known limitations / TODO
 
-- **Found while fixing pool exhaustion counting, not yet fixed:** if
-  `alloc_child()` runs out mid-dispatch in `dispatch_child_orders`, the loop
-  breaks and sends fewer children than the SOR actually calculated, but
-  `parent.leaves_qty_lots` and the `pos_.reserve_open()` call in
-  `on_strategy_order` both still assume the full size went out. Nothing
-  reconciles that gap right now. Needs the parent's reserved size to shrink
-  to what was actually dispatched, or a synthetic partial-reject to unwind
-  the difference.
-- Pool exhaustion is counted (`OMSOrderPool::parent_alloc_failures()` /
-  `child_alloc_failures()`) and logged, but there's still no channel back to
-  the strategy layer to notify it a signal was rejected. Risk-reject and the
-  notional gate's hard-block don't have one either, this isn't unique to pool
-  exhaustion, it's a gap in the whole reject-notification story, would need a
-  new outbound queue and a reason enum.
+- **Fixed**, was previously the top item here: `alloc_child()` running out
+  mid-dispatch used to leave `parent.leaves_qty_lots` and the margin
+  `reserve_open()` reserved upfront out of sync with what actually made it to
+  an exchange, permanently, since nothing ever triggered a reroute or freed
+  the parent. `dispatch_child_orders` now releases the margin for whatever
+  didn't get dispatched, and `handle_fill` now checks `all_children_terminal`
+  the same way `handle_cancel_reject` already did, so a parent whose last
+  live child gets *filled* (not canceled) still gets rerouted for any
+  remaining gap instead of sitting there forever. Found the same "parked
+  forever, never freed" shape in `reroute_leaves`'s `REROUTE_NO_LIQUIDITY`
+  path while fixing this and closed that too. Covered by two
+  `ExecutionCore`-level tests in `test_oms.cpp` that drive the real pool to
+  exhaustion through the public API, not mocks.
+- No channel back to the strategy layer to notify it a signal was rejected.
+  Risk-reject, the notional gate's hard-block, and pool exhaustion (counted
+  via `OMSOrderPool::parent_alloc_failures()` / `child_alloc_failures()` and
+  logged, but not surfaced anywhere else) all just drop the signal today.
+  Needs a new outbound queue and a reject-reason enum, then wiring three
+  existing call sites through it, not a small change.
 - Lot size is configured in three independent places that all have to agree
   by convention, not by construction: `RiskLimits.lot_size[instr]`,
   `NotionalConfirmationGate`'s constructor param, and `RoutingContext`'s
   fallback to `states[0].book.lot_size`. Works today because the demos keep
   them in sync by hand. A real instrument registry that all three read from
   would remove the "by convention" part.
-- Vol/imbalance at reroute time reuse the original signal's values instead of
-  re-reading `BookSnapshotCache` for current conditions.
 - No maker routing. 100% taker.
 - `oms_example_san` duplicates sources instead of linking `sor_lib`/`oms_lib`, easy to forget to update if a new file gets added to either.
 
