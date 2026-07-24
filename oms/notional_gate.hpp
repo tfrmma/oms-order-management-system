@@ -27,8 +27,8 @@ struct NotionalGateConfig {
 class NotionalConfirmationGate {
 public:
     explicit NotionalConfirmationGate(const NotionalGateConfig& cfg,
-                                      double lot_size = 0.001) noexcept
-        : cfg_(cfg), lot_size_(lot_size)
+                                      const InstrumentTable&    instruments) noexcept
+        : cfg_(cfg), instruments_(instruments)
     {}
 
     // returns true if the order is approved to proceed.
@@ -41,7 +41,8 @@ public:
             return true;
         }
 
-        const double notional = static_cast<double>(sig.qty_lots) * lot_size_ * sig.limit_price_usd;
+        const double lot_size = instruments_.lot_size(sig.instr_id);
+        const double notional = static_cast<double>(sig.qty_lots) * lot_size * sig.limit_price_usd;
         const char*  dir_str  = (sig.dir == sor::OrderDir::BUY) ? "BUY" : "SELL";
 
         if (cfg_.hard_block_usd > 0.0 && notional > cfg_.hard_block_usd) {
@@ -58,16 +59,18 @@ public:
         }
 
         // above threshold, need explicit confirmation
-        return prompt_confirmation(dir_str, notional, sig);
+        return prompt_confirmation(dir_str, notional, lot_size, sig);
     }
 
     void update_config(const NotionalGateConfig& cfg) noexcept { cfg_ = cfg; }
+    void update_instruments(const InstrumentTable& t) noexcept { instruments_ = t; }
 
 private:
     [[nodiscard]] bool prompt_confirmation(const char*                dir_str,
                                            double                     notional,
+                                           double                     lot_size,
                                            const StrategyOrderSignal& sig) noexcept {
-        const double qty = static_cast<double>(sig.qty_lots) * lot_size_;
+        const double qty = static_cast<double>(sig.qty_lots) * lot_size;
 
         std::fprintf(stderr,
             "\n"
@@ -131,8 +134,8 @@ private:
         (void)sig;
     }
 
-    NotionalGateConfig cfg_;
-    double             lot_size_;
+    NotionalGateConfig      cfg_;
+    InstrumentTable         instruments_;
 };
 
 } // namespace oms
