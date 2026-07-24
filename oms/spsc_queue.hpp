@@ -46,6 +46,7 @@ private:
 
 template<typename T> using GatewayQueue = SpscQueue<T, 512>;
 template<typename T> using InboundQueue  = SpscQueue<T, 1024>;
+template<typename T> using OutboundQueue = SpscQueue<T, 1024>;  // OMS -> strategy, e.g. reject_queue
 
 // what goes on the wire to a gateway thread
 struct OutboundOrder {
