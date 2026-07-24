@@ -25,6 +25,7 @@ struct GatewayHandle {
 struct ExecCoreConfig {
     sor::FeeMatrix       fees;
     RiskLimits           risk_limits;
+    InstrumentTable      instruments{};
     NotionalGateConfig   notional_gate{};
     DashboardConfig      dashboard{};
     MarginConfig         margin{};
@@ -47,6 +48,7 @@ public:
 
     InboundQueue<StrategyOrderSignal>  strategy_queue;
     InboundQueue<ExecutionReport>      exec_report_queue;
+    OutboundQueue<OrderReject>         reject_queue;  // strategy thread drains this
 
     // feed handler / REST reconciliation threads call these
     void on_mark_price(double mark_usd, double lot_size, instr_id_t instr_id) noexcept {
@@ -82,6 +84,19 @@ private:
     void reroute_leaves(ParentOrder& parent) noexcept;
 
     [[nodiscard]] bool all_children_terminal(const ParentOrder& parent) const noexcept;
+
+    // a child's fill/leaves qty is in ITS exchange's native lot_size, but
+    // everything at the parent/position level (cum_qty_lots, net_qty_lots,
+    // open_*_lots) is tracked in the instrument's canonical unit. convert
+    // before touching any of those, or fills from exchanges with different
+    // native lot sizes silently corrupt each other's accounting.
+    [[nodiscard]] qty_t to_canonical_lots(const ChildOrderState& child,
+                                          instr_id_t             instr_id,
+                                          qty_t                  native_lots) const noexcept;
+
+    void notify_reject(const StrategyOrderSignal& sig, RejectReason reason) noexcept;
+    void notify_reject(instr_id_t instr_id, sor::OrderDir dir, uint8_t strategy_id,
+                       qty_t qty_lots, RejectReason reason) noexcept;
 
     OMSOrderPool            pool_{};
     PositionTable           pos_{};
