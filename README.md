@@ -126,6 +126,34 @@ local number that leans towards blocking trades is a much safer default than
 a slow, correct one that might arrive after you've already blown through your
 margin.
 
+**One instrument table, everyone reads it.** `lot_size` used to be configured
+in four independent places that had to agree by convention: `RiskLimits`,
+`NotionalConfirmationGate`'s constructor, `RoutingContext`'s fallback, and
+`cfg.dashboard.lot_size` doing double duty as a stand-in everywhere else
+needed a default. The last one was an actual bug, not just duplication:
+`handle_fill`/`handle_cancel_reject` summed `ExecutionReport.fill_qty_lots`
+(native to whichever exchange the fill came from) straight into
+`parent.cum_qty_lots` and `pos_.net_qty_lots` (the instrument's canonical
+unit) with no conversion, so a fill from an exchange with a different native
+lot size silently under- or over-counted the position. `InstrumentTable` is
+now the one place `lot_size` lives, `PreTradeRiskEngine` and
+`NotionalConfirmationGate` both hold a copy (same pattern as `RiskLimits`,
+not a reference, no construction-order dependency to get wrong), and
+`ExecutionCore::to_canonical_lots` converts every fill through it before
+touching anything at the parent or position level.
+
+**Rejects are a queue, not a log line.** Every place a signal can die,
+`PreTradeRiskEngine`, the notional gate's hard block, pool exhaustion at
+either the parent or child level, or the SOR finding no liquidity, pushes an
+`OrderReject` (instrument, direction, qty, and a `RejectReason`) onto
+`ExecutionCore::reject_queue`. The reason enum is deliberately flat: no
+separate "retryable" flag, `RISK_*`/`NOTIONAL_GATE_BLOCK` already mean "fix
+the order" and `POOL_EXHAUSTED`/`NO_LIQUIDITY` already mean "try again
+later", a strategy can switch on the reason directly instead of needing a
+second field to interpret it. A partial dispatch (see `DISPATCH_GAP` in
+`dispatch_child_orders`) is deliberately not a reject: that portion is still
+alive and tracked on its parent, not dead.
+
 **Lot sizes are canonicalized per routing decision, not globally.**
 `RoutingContext::reference_lot_size` declares what "1 lot" means for one
 specific `calculate_optimal_split` call. Every active exchange's book gets
@@ -135,6 +163,9 @@ same call produces a correct split instead of silently treating "10 lots" as
 the same real-world quantity on both venues. Leave it at 0 and it falls back
 to the first active exchange's native lot size, which is exactly the old
 (single-lot-size-only) behavior, so nothing breaks if you don't need this.
+`ExecutionCore` always sets it explicitly from `InstrumentTable` instead of
+relying on that fallback, direct `sor::RoutingEngine` callers (like
+`main_example.cpp`) still get the fallback for free.
 
 ---
 
@@ -142,6 +173,8 @@ to the first active exchange's native lot size, which is exactly the old
 
 ```
 oms-order-management-system/
+├── .github/workflows/ci.yml  # build+test on Release, build+run on ASan/UBSan
+│
 ├── sor/                      # pure decision function, no lifecycle state
 │   ├── types.hpp             # price_t/qty_t, ChildOrder, CostSlice, SplitResult
 │   ├── normalized_book.hpp   # SoA order book, precomputed cumulative qty
@@ -149,13 +182,13 @@ oms-order-management-system/
 │   └── routing_engine.hpp/cpp
 │
 ├── oms/                      # everything stateful: lifecycle, risk, position
-│   ├── oms_types.hpp         # StrategyOrderSignal, ExecutionReport, Result<T>
+│   ├── oms_types.hpp         # StrategyOrderSignal, ExecutionReport, InstrumentTable, OrderReject, Result<T>
 │   ├── order_pool.hpp        # ParentOrder, ChildOrderState, OMSOrderPool
 │   ├── position_tracker.hpp  # InstrumentPosition, MarginState
 │   ├── risk_engine.hpp       # PreTradeRiskEngine
 │   ├── notional_gate.hpp     # NotionalConfirmationGate
 │   ├── margin_monitor.hpp    # MarginMonitor, two-layer margin model
-│   ├── spsc_queue.hpp        # SpscQueue, GatewayQueue/InboundQueue aliases
+│   ├── spsc_queue.hpp        # SpscQueue, GatewayQueue/InboundQueue/OutboundQueue aliases
 │   ├── timer_wheel.hpp       # TimerWheel, cancel-on-timeout
 │   ├── book_snapshot.hpp     # BookSnapshotCache, feed-handler-written vol/imb
 │   ├── logger.hpp            # AsyncLogger, lock-free ring + drain thread
@@ -163,7 +196,7 @@ oms-order-management-system/
 │   └── execution_core.hpp/cpp # ExecutionCore, ties all of the above together
 │
 ├── tests/
-│   ├── test_oms.cpp          # Catch2 suite, SOR + OMS component tests
+│   ├── test_oms.cpp          # Catch2 suite, SOR + OMS component + integration tests
 │   └── catch_amalgamated.*   # vendored Catch2, see tests/LICENSE.txt
 │
 ├── main_example.cpp          # standalone SOR demo, no OMS involved
@@ -176,12 +209,13 @@ oms-order-management-system/
 | Component | Owns | Explicitly does not |
 |---|---|---|
 | `sor::RoutingEngine` | Splitting one target size across N exchange books at one point in time | Remember anything about a previous call, know what an "order" is beyond a size and a direction |
+| `oms::InstrumentTable` | The one `lot_size` every other component reads | Tick size, symbols, anything beyond what's needed today |
 | `oms::PreTradeRiskEngine` | Fat-finger, position limit, notional, margin checks, ~100ns budget | Know about exchanges, books, or the SOR at all |
 | `oms::NotionalConfirmationGate` | The one deliberately blocking call in the pipeline | Run on the execution thread's hot path for small orders (auto-approves below threshold) |
 | `oms::OMSOrderPool` | Parent/child order storage, O(1) alloc/free | Allocate anything after startup |
 | `oms::MarginMonitor` | Reconciling a fast local estimate against slow REST ground truth | Trust the fast estimate when it disagrees optimistically with REST |
 | `oms::TimerWheel` | Cancel-on-timeout for dispatched children | Retry logic, that's `reroute_leaves`'s job once a cancel report comes back |
-| `oms::ExecutionCore` | Wiring all of the above into one order lifecycle | Run on more than one thread |
+| `oms::ExecutionCore` | Wiring all of the above into one order lifecycle, notifying `reject_queue` on every dead end | Run on more than one thread |
 
 ---
 
@@ -216,21 +250,37 @@ ceiling for one split.
 `ExecutionCore::on_strategy_order`, one signal end to end:
 
 1. `NotionalConfirmationGate::approve`, auto-approve, hard-block, or a
-   blocking stdin confirmation depending on USD notional.
+   blocking stdin confirmation depending on USD notional. A hard block or a
+   "no" at the prompt pushes `RejectReason::NOTIONAL_GATE_BLOCK` onto
+   `reject_queue`.
 2. `pool_.alloc_parent()`, fails cleanly and gets counted
-   (`parent_alloc_failures()`) instead of corrupting state if the pool's full.
+   (`parent_alloc_failures()`) instead of corrupting state if the pool's full,
+   and pushes `RejectReason::PARENT_POOL_EXHAUSTED`.
 3. `PreTradeRiskEngine::validate`, fat-finger, then position limit, then margin
    (which itself can reject for `NOTIONAL` or `MARGIN`, propagated as the real
-   reason, not collapsed into one).
+   reason, not collapsed into one). Each maps to its own `RejectReason`.
 4. `build_routing_context` + `sor_.calculate_optimal_split`, the SOR runs
-   exactly once per signal here, with no memory of anything before it.
+   exactly once per signal here, with no memory of anything before it. Zero
+   liquidity pushes `RejectReason::NO_LIQUIDITY`.
 5. `dispatch_child_orders`, one `alloc_child()` + `timer_wheel_.insert()`
-   per child, pushed onto that exchange's `GatewayQueue<OutboundOrder>`.
+   per child, pushed onto that exchange's `GatewayQueue<OutboundOrder>`. If
+   fewer children make it out than the SOR intended, whether from the child
+   pool running out or hitting `ParentOrder::kMaxChildrenPerParent`, the
+   undispatched remainder's margin reservation is released immediately
+   (`DISPATCH_GAP`, see `to_canonical_lots`), and if literally nothing made
+   it out, `RejectReason::CHILD_POOL_EXHAUSTED` is pushed and the parent is
+   freed instead of parked forever.
 6. Fills and cancels arrive on `exec_report_queue`, `on_execution_report`
-   routes to `handle_fill` or `handle_cancel_reject`.
+   routes to `handle_fill` or `handle_cancel_reject`. Both convert the
+   report's `fill_qty_lots` (native to whichever exchange it came from) into
+   the instrument's canonical unit via `to_canonical_lots` before touching
+   `parent.cum_qty_lots` or `pos_`, so mixed-lot-size fills don't corrupt
+   position or margin accounting.
 7. If a parent still has `leaves_qty_lots > 0` once all its current children
-   are terminal, `reroute_leaves` rebuilds the `RoutingContext` from the
-   current book state and calls the SOR again for the remainder.
+   are terminal, whether they got there via a fill or a cancel,
+   `reroute_leaves` rebuilds the `RoutingContext` from the current book state
+   and calls the SOR again for the remainder. Still no liquidity here either
+   pushes `RejectReason::NO_LIQUIDITY` for the gap and frees the parent.
 
 The timer wheel fires independently of all of this: if a child sits in
 `PENDING_NEW`/`PARTIALLY_FILLED` past `child_timeout_ns`, the wheel's callback
@@ -273,6 +323,9 @@ make -j$(nproc)
 
 Requires C++20 and GCC or Clang. Tested on GCC 13, Ubuntu 24. `-march=native` is on by default in Release.
 
+`.github/workflows/ci.yml` runs the same Release build+test+smoke-test path
+plus a separate ASan/UBSan job on every push and PR to `main`.
+
 ASan + UBSan build:
 ```bash
 cmake .. -DCMAKE_BUILD_TYPE=Debug
@@ -292,10 +345,11 @@ Covers the SOR merge/fill algorithm (single and multi-exchange, partial
 fills, limit price clipping, BUY/SELL sign handling, mismatched lot sizes
 across exchanges), `OMSOrderPool` alloc/free and failure counting,
 `InstrumentPosition` avg price tracking, `PreTradeRiskEngine` rejection
-paths, `SpscQueue`, `TimerWheel`, and two `ExecutionCore` integration tests
-that drive a real pool to exhaustion through `on_strategy_order` (the public
-API, not a mock) to prove the dispatch-gap margin/reroute fix above actually
-holds end to end.
+paths, `SpscQueue`, `TimerWheel`, and four `ExecutionCore` integration tests
+that drive a real pool through `on_strategy_order` (the public API, not a
+mock): the dispatch-gap margin/reroute fix, cross-exchange fill accounting
+through `InstrumentTable`, and `reject_queue` delivering the right
+`RejectReason` for risk, liquidity, and notional-gate rejections.
 
 Built with `-fno-exceptions` like the rest of the project. Catch2
 auto-detects this and switches `REQUIRE` to abort the whole binary on
@@ -320,10 +374,10 @@ for (uint32_t i = 0; i < 5; ++i) {
     cfg.gateways[i].exchange_id = i;
     cfg.gateways[i].connected   = true;
 }
-cfg.risk_limits.max_order_lots[BTC_PERP] = to_lots(10.0, 0.001);
-cfg.risk_limits.max_net_lots[BTC_PERP]   = to_lots(50.0, 0.001);
-cfg.risk_limits.lot_size[BTC_PERP]       = 0.001;
-cfg.risk_limits.max_notional_usd         = 500'000.0;
+cfg.risk_limits.max_order_lots[BTC_PERP]      = to_lots(10.0, 0.001);
+cfg.risk_limits.max_net_lots[BTC_PERP]        = to_lots(50.0, 0.001);
+cfg.risk_limits.max_notional_usd              = 500'000.0;
+cfg.instruments.instruments[BTC_PERP].lot_size = 0.001;  // read by risk, gate, and routing
 
 // ~2.8 MB, don't put it on the stack
 auto core = std::make_unique<ExecutionCore>(cfg);
@@ -340,13 +394,21 @@ sig.short_vol_factor = 0.3;
 sig.book_imbalance   = 0.15;
 core->strategy_queue.push(sig);
 
-// gateway threads push fills
+// gateway threads push fills. fill_qty_lots is in THIS exchange's native
+// lot size, ExecutionCore converts it internally, don't pre-convert it.
 ExecutionReport rep{};
 rep.child_id         = child_id_from_exchange_ack;
 rep.fill_price_ticks = to_ticks(65100.0, 0.5);
 rep.fill_qty_lots    = to_lots(0.374, 0.001);
 rep.exec_type        = ExecType::FILL;
 core->exec_report_queue.push(rep);
+
+// strategy drains rejects on its own thread, not the execution thread
+OrderReject rej{};
+while (core->reject_queue.pop(rej)) {
+    log("order rejected: instr=%u qty=%ld reason=%u",
+        rej.instr_id, (long)rej.qty_lots, (unsigned)rej.reason);
+}
 ```
 
 `limit_price_usd` is in USD, the OMS converts to ticks internally. If a child
@@ -373,31 +435,43 @@ Constants were calibrated against internal fill data. Recalibrate for your excha
 
 ## Known limitations / TODO
 
-- **Fixed**, was previously the top item here: `alloc_child()` running out
-  mid-dispatch used to leave `parent.leaves_qty_lots` and the margin
-  `reserve_open()` reserved upfront out of sync with what actually made it to
-  an exchange, permanently, since nothing ever triggered a reroute or freed
-  the parent. `dispatch_child_orders` now releases the margin for whatever
-  didn't get dispatched, and `handle_fill` now checks `all_children_terminal`
-  the same way `handle_cancel_reject` already did, so a parent whose last
-  live child gets *filled* (not canceled) still gets rerouted for any
-  remaining gap instead of sitting there forever. Found the same "parked
-  forever, never freed" shape in `reroute_leaves`'s `REROUTE_NO_LIQUIDITY`
-  path while fixing this and closed that too. Covered by two
-  `ExecutionCore`-level tests in `test_oms.cpp` that drive the real pool to
-  exhaustion through the public API, not mocks.
-- No channel back to the strategy layer to notify it a signal was rejected.
-  Risk-reject, the notional gate's hard-block, and pool exhaustion (counted
-  via `OMSOrderPool::parent_alloc_failures()` / `child_alloc_failures()` and
-  logged, but not surfaced anywhere else) all just drop the signal today.
-  Needs a new outbound queue and a reject-reason enum, then wiring three
-  existing call sites through it, not a small change.
-- Lot size is configured in three independent places that all have to agree
-  by convention, not by construction: `RiskLimits.lot_size[instr]`,
-  `NotionalConfirmationGate`'s constructor param, and `RoutingContext`'s
-  fallback to `states[0].book.lot_size`. Works today because the demos keep
-  them in sync by hand. A real instrument registry that all three read from
-  would remove the "by convention" part.
+- **Fixed:** `alloc_child()` running out mid-dispatch used to leave
+  `parent.leaves_qty_lots` and the margin `reserve_open()` reserved upfront
+  out of sync with what actually made it to an exchange, permanently, since
+  nothing ever triggered a reroute or freed the parent. `dispatch_child_orders`
+  now releases the margin for whatever didn't get dispatched, and `handle_fill`
+  now checks `all_children_terminal` the same way `handle_cancel_reject`
+  already did, so a parent whose last live child gets *filled* (not canceled)
+  still gets rerouted for any remaining gap instead of sitting there forever.
+  Found and closed the same "parked forever, never freed" shape in
+  `reroute_leaves`'s `REROUTE_NO_LIQUIDITY` path while fixing this.
+- **Fixed:** `ExecutionCore::reject_queue` now exists. `PreTradeRiskEngine`,
+  the notional gate's hard block, pool exhaustion at either the parent or
+  child level, and the SOR finding no liquidity (first dispatch or reroute)
+  all push an `OrderReject` with a specific `RejectReason` instead of just
+  logging and dropping the signal.
+- **Fixed, and this one was an actual accounting bug, not just duplication:**
+  `lot_size` used to be configured in four independent places (`RiskLimits`,
+  the notional gate's constructor, `RoutingContext`'s fallback, and
+  `cfg.dashboard.lot_size` doing double duty as a stand-in everywhere else).
+  The dashboard one being reused inside `handle_fill`/`handle_cancel_reject`
+  meant a fill's native per-exchange lot count got summed directly into
+  `parent.cum_qty_lots` and `pos_.net_qty_lots` (both canonical) with no
+  conversion, silently mis-tracking position and margin the moment two
+  exchanges for the same instrument disagreed on lot size. Now there's one
+  `InstrumentTable`, and `ExecutionCore::to_canonical_lots` converts every
+  fill through it before touching parent or position state.
+- **Found while re-verifying the above, not fixed, unrelated to any of it:**
+  `oms_example.cpp`'s demo dispatches 11 children within nanoseconds of each
+  other, all with the same `child_timeout_ns` deadline, and `TimerWheel`'s
+  per-slot capacity is 8 (`kSlotDepth`). Three of them log `SLOT_FULL` and
+  fall back to "treating as timeout" immediately instead of actually waiting
+  out the 2-second window. Harmless for the demo, a real venue with actual
+  network latency won't dispatch this many orders in the same microsecond,
+  but it's a real gap for anyone who does burst that hard, worth either
+  raising `kSlotDepth` or spreading same-tick deadlines across neighboring
+  slots. Only surfaced now because every earlier verification run redirected
+  `oms_example`'s stderr to `/dev/null` and only checked the exit code.
 - No maker routing. 100% taker.
 - `oms_example_san` duplicates sources instead of linking `sor_lib`/`oms_lib`, easy to forget to update if a new file gets added to either.
 
