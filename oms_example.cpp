@@ -89,7 +89,7 @@ int main() {
     for (uint8_t i = 0; i < kMaxInstruments; ++i) {
         cfg.risk_limits.max_order_lots[i] = to_lots(10.0, 0.001);
         cfg.risk_limits.max_net_lots[i]   = to_lots(50.0, 0.001);
-        cfg.risk_limits.lot_size[i]       = 0.001;
+        cfg.instruments.instruments[i].lot_size = 0.001;
     }
     cfg.risk_limits.max_notional_usd    = 400'000.0;
     cfg.risk_limits.min_margin_required = 0.0;
