@@ -322,10 +322,11 @@ TEST_CASE("InstrumentPosition: side flip resets cost basis to the flipping fill'
 TEST_CASE("PreTradeRiskEngine: rejects and passes for the right reasons") {
     PositionTable pos{};
     RiskLimits limits{};
+    InstrumentTable instruments{};  // unconfigured, relies on InstrumentTable::kFallbackLotSize (0.001)
 
     SECTION("fat finger") {
         limits.max_order_lots[0] = 100;
-        PreTradeRiskEngine risk(limits, pos);
+        PreTradeRiskEngine risk(limits, instruments, pos);
 
         StrategyOrderSignal sig{};
         sig.instr_id = 0;
@@ -336,7 +337,7 @@ TEST_CASE("PreTradeRiskEngine: rejects and passes for the right reasons") {
     SECTION("position limit") {
         limits.max_net_lots[0] = 50;
         pos.instruments[0].net_qty_lots.store(40);
-        PreTradeRiskEngine risk(limits, pos);
+        PreTradeRiskEngine risk(limits, instruments, pos);
 
         StrategyOrderSignal sig{};
         sig.instr_id = 0;
@@ -347,19 +348,19 @@ TEST_CASE("PreTradeRiskEngine: rejects and passes for the right reasons") {
 
     SECTION("notional cap") {
         limits.max_notional_usd = 10'000.0;
-        PreTradeRiskEngine risk(limits, pos);
+        PreTradeRiskEngine risk(limits, instruments, pos);
 
         StrategyOrderSignal sig{};
         sig.instr_id        = 0;
         sig.qty_lots        = 1000;
-        sig.limit_price_usd = 50'000.0;  // 1000 * 0.001 * 50000 = 50000 > 10000
+        sig.limit_price_usd = 50'000.0;  // 1000 * 0.001 (fallback lot_size) * 50000 = 50000 > 10000
         REQUIRE(risk.validate(sig) == RiskRejectReason::NOTIONAL);
     }
 
     SECTION("margin") {
         limits.min_margin_required = 1000.0;
         pos.margin.update(/*equity=*/500.0, /*used=*/0.0);
-        PreTradeRiskEngine risk(limits, pos);
+        PreTradeRiskEngine risk(limits, instruments, pos);
 
         StrategyOrderSignal sig{};
         sig.instr_id = 0;
@@ -373,7 +374,7 @@ TEST_CASE("PreTradeRiskEngine: rejects and passes for the right reasons") {
         limits.max_notional_usd    = 1'000'000.0;
         limits.min_margin_required = 0.0;
         pos.margin.update(50'000.0, 0.0);
-        PreTradeRiskEngine risk(limits, pos);
+        PreTradeRiskEngine risk(limits, instruments, pos);
 
         StrategyOrderSignal sig{};
         sig.instr_id        = 0;
@@ -460,7 +461,7 @@ TEST_CASE("ExecutionCore: undispatched children release their margin reservation
     cfg.active_exchanges = 1;
     cfg.risk_limits.max_order_lots[0]  = 100'000;
     cfg.risk_limits.max_net_lots[0]    = 100'000;
-    cfg.risk_limits.lot_size[0]        = 1.0;
+    cfg.instruments.instruments[0].lot_size = 1.0;
     cfg.margin.equity_usd              = 1e9;
     cfg.notional_gate.auto_approve_usd = 1e12;  // market orders skip the gate anyway (limit_price_usd = 0)
     cfg.dashboard.enabled              = false; // no need for a live snapshot thread in a unit test
@@ -530,7 +531,7 @@ TEST_CASE("ExecutionCore: a parent whose last dispatched child fills still gets 
     cfg.active_exchanges = 1;
     cfg.risk_limits.max_order_lots[0]  = 1000;
     cfg.risk_limits.max_net_lots[0]    = 1000;
-    cfg.risk_limits.lot_size[0]        = 1.0;
+    cfg.instruments.instruments[0].lot_size = 1.0;
     cfg.margin.equity_usd              = 1e9;
     cfg.notional_gate.auto_approve_usd = 1e12;
     cfg.dashboard.enabled              = false;
@@ -570,4 +571,138 @@ TEST_CASE("ExecutionCore: a parent whose last dispatched child fills still gets 
     REQUIRE(core.pool().children_in_use() == 4);
     REQUIRE(core.pool().parents_in_use()  == 1);  // same parent, still tracked, not orphaned
     REQUIRE(core.positions().instruments[0].net_qty_lots.load() == 16);
+}
+
+TEST_CASE("ExecutionCore: fills from exchanges with different native lot sizes convert to canonical units") {
+    // exchange 0: native lot_size 1.0 (1 lot = 1 real unit), best price.
+    // exchange 1: native lot_size 4.0 (1 lot = 4 real units), worse price so
+    // it only gets used for the remainder after exchange 0's depth is spent.
+    // ExecutionReport.fill_qty_lots always arrives in the reporting child's
+    // OWN native unit, this is what used to get summed directly into
+    // parent.cum_qty_lots / pos_.net_qty_lots without conversion.
+    ExchangeState ex[2]{};
+    init_exchange(ex[0], 0);
+    init_exchange(ex[1], 1);
+    ex[1].book.lot_size = 4.0;
+    ex[1].lot.lot_size  = 4.0;
+    set_levels(ex[0].book.asks(), {{100, 10}});  // 10 real units
+    set_levels(ex[1].book.asks(), {{101, 5}});   // 5 native lots = 20 real units, worse price
+
+    ExecCoreConfig cfg{};
+    cfg.exchange_states  = ex;
+    cfg.active_exchanges = 2;
+    cfg.risk_limits.max_order_lots[0]  = 1000;
+    cfg.risk_limits.max_net_lots[0]    = 1000;
+    cfg.instruments.instruments[0].lot_size = 1.0;  // canonical unit: 1 real unit
+    cfg.margin.equity_usd              = 1e9;
+    cfg.notional_gate.auto_approve_usd = 1e12;
+    cfg.dashboard.enabled              = false;
+
+    ExecutionCore core(cfg);
+
+    StrategyOrderSignal sig{};
+    sig.instr_id = 0;
+    sig.dir      = OrderDir::BUY;
+    sig.qty_lots = 18;   // 10 from exchange 0 (its full depth) + 8 real units from exchange 1
+
+    core.on_strategy_order(sig);
+    REQUIRE(core.pool().children_in_use() == 2);
+
+    // deterministic ids on a fresh pool: child 0 is exchange 0's leg (10 real
+    // units, native lot_size 1.0 so native == canonical == 10), child 1 is
+    // exchange 1's leg (8 real units -> to_lots(8.0, 4.0) = 2 native lots).
+    ExecutionReport fill0{};
+    fill0.child_id        = 0;
+    fill0.exec_type       = ExecType::FILL;
+    fill0.exchange_id     = 0;
+    fill0.fill_qty_lots   = 10;   // native, exchange 0
+    fill0.fill_price_ticks = 100;
+    fill0.recv_ns          = 1;
+    core.on_execution_report(fill0);
+
+    ExecutionReport fill1{};
+    fill1.child_id        = 1;
+    fill1.exec_type       = ExecType::FILL;
+    fill1.exchange_id     = 1;
+    fill1.fill_qty_lots   = 2;    // native, exchange 1: 2 native lots * 4.0 = 8 real units
+    fill1.fill_price_ticks = 101;
+    fill1.recv_ns          = 1;
+    core.on_execution_report(fill1);
+
+    // 10 (native==canonical on exchange 0) + 8 (2 native lots * 4.0 lot_size,
+    // converted) = 18 canonical units, exactly the original order size.
+    // before the fix this would read 10 + 2 = 12: exchange 1's native lot
+    // count summed directly instead of converted to real units first.
+    REQUIRE(core.positions().instruments[0].net_qty_lots.load() == 18);
+    REQUIRE(core.pool().parents_in_use()  == 0);  // fully filled, freed
+    REQUIRE(core.pool().children_in_use() == 0);
+}
+
+TEST_CASE("ExecutionCore: rejected signals land on reject_queue with the right reason") {
+    ExchangeState ex{};
+    init_exchange(ex, 0);
+    set_levels(ex.book.asks(), {{100, 1000}});  // plenty of liquidity for the paths that need it
+
+    ExecCoreConfig cfg{};
+    cfg.exchange_states  = &ex;
+    cfg.active_exchanges = 1;
+    cfg.instruments.instruments[0].lot_size = 1.0;
+    cfg.margin.equity_usd = 1e9;
+    cfg.dashboard.enabled = false;
+
+    SECTION("risk fat-finger reject") {
+        cfg.risk_limits.max_order_lots[0]  = 5;
+        cfg.notional_gate.auto_approve_usd = 1e12;
+        ExecutionCore core(cfg);
+
+        StrategyOrderSignal sig{};
+        sig.instr_id = 0;
+        sig.dir      = OrderDir::BUY;
+        sig.qty_lots = 500;  // way over max_order_lots
+        core.on_strategy_order(sig);
+
+        OrderReject rej{};
+        REQUIRE(core.reject_queue.pop(rej));
+        REQUIRE(rej.reason      == RejectReason::RISK_FAT_FINGER);
+        REQUIRE(rej.instr_id    == 0);
+        REQUIRE(rej.qty_lots    == 500);
+        REQUIRE(core.pool().parents_in_use() == 0);  // never made it past risk, freed
+    }
+
+    SECTION("no liquidity reject") {
+        cfg.risk_limits.max_order_lots[0]  = 100'000;
+        cfg.notional_gate.auto_approve_usd = 1e12;
+        ExchangeState empty{};
+        init_exchange(empty, 0);  // valid book, zero levels: no liquidity, not a bad book
+        cfg.exchange_states = &empty;
+        ExecutionCore core(cfg);
+
+        StrategyOrderSignal sig{};
+        sig.instr_id = 0;
+        sig.dir      = OrderDir::BUY;
+        sig.qty_lots = 10;
+        core.on_strategy_order(sig);
+
+        OrderReject rej{};
+        REQUIRE(core.reject_queue.pop(rej));
+        REQUIRE(rej.reason == RejectReason::NO_LIQUIDITY);
+    }
+
+    SECTION("notional gate hard block") {
+        cfg.risk_limits.max_order_lots[0]  = 100'000;
+        cfg.notional_gate.hard_block_usd   = 1'000.0;
+        ExecutionCore core(cfg);
+
+        StrategyOrderSignal sig{};
+        sig.instr_id        = 0;
+        sig.dir              = OrderDir::BUY;
+        sig.qty_lots         = 100;
+        sig.limit_price_usd  = 500.0;  // 100 * 1.0 * 500 = 50,000 USD, way over the 1,000 hard block
+        core.on_strategy_order(sig);
+
+        OrderReject rej{};
+        REQUIRE(core.reject_queue.pop(rej));
+        REQUIRE(rej.reason == RejectReason::NOTIONAL_GATE_BLOCK);
+        REQUIRE(core.pool().parents_in_use() == 0);  // blocked before any parent was even allocated
+    }
 }
