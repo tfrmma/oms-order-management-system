@@ -32,9 +32,15 @@ struct TimerEntry {
 
 // 1024 fine slots × 64 coarse slots = ~65 seconds of coverage at 1ms resolution.
 // slots are hashed by deadline, collisions are resolved by scanning the slot.
-// slot depth of 8 handles bursts of simultaneous orders without spilling.
+//
+// slot depth used to be 8, "handles bursts without spilling". it didn't:
+// every child of one parent shares the same dispatch timestamp and the same
+// child_timeout_ns, so they all hash to the same slot, and a single order
+// can legitimately produce up to ParentOrder::kMaxChildrenPerParent (16)
+// children in one dispatch. depth 32 covers one maxed-out order with room
+// for a second one landing in the same 1ms tick, not just a guess this time.
 inline constexpr uint32_t kFineSlots   = 1024;
-inline constexpr uint32_t kSlotDepth  = 8;     // max concurrent timers per slot
+inline constexpr uint32_t kSlotDepth  = 32;     // max concurrent timers per slot
 
 class TimerWheel {
 public:
