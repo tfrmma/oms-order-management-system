@@ -14,9 +14,9 @@ static inline uint64_t now_ns() noexcept {
 namespace oms {
 
 ExecutionCore::ExecutionCore(const ExecCoreConfig& cfg) noexcept
-    : risk_(cfg.risk_limits, pos_)
+    : risk_(cfg.risk_limits, cfg.instruments, pos_)
     , sor_(cfg.fees)
-    , notional_gate_(cfg.notional_gate, cfg.dashboard.lot_size)
+    , notional_gate_(cfg.notional_gate, cfg.instruments)
     , dashboard_(pool_, pos_, cfg.dashboard)
     , timer_wheel_(1'000'000ULL)   // 1ms tick resolution
     , margin_monitor_(cfg.margin, pos_)
@@ -79,6 +79,7 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
 
     if (!notional_gate_.approve(sig)) {
         g_log.warn("ORDER_BLOCKED_NOTIONAL_GATE  instr=%u  qty=%ld", (unsigned)sig.instr_id, (long)sig.qty_lots);
+        notify_reject(sig, RejectReason::NOTIONAL_GATE_BLOCK);
         return;
     }
 
@@ -86,6 +87,7 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
     if (!id_res.ok) [[unlikely]] {
         g_log.error("POOL_EXHAUSTED  parents_in_use=%u  total_failures=%lu  SIGNAL_DROPPED",
             pool_.parents_in_use(), (unsigned long)pool_.parent_alloc_failures());
+        notify_reject(sig, RejectReason::PARENT_POOL_EXHAUSTED);
         return;
     }
 
@@ -105,11 +107,24 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
         ? sor::to_ticks(sig.limit_price_usd, tick_sz)
         : price_t(0);
 
-    if (risk_.validate(sig) != RiskRejectReason::OK) [[unlikely]] {
-        g_log.error("RISK_REJECT  parent_id=%u  instr=%u  qty=%ld  limit_usd=%.2f",
-            id_res.value, (unsigned)sig.instr_id, (long)sig.qty_lots, sig.limit_price_usd);
+    const RiskRejectReason risk_result = risk_.validate(sig);
+    if (risk_result != RiskRejectReason::OK) [[unlikely]] {
+        g_log.error("RISK_REJECT  parent_id=%u  instr=%u  qty=%ld  limit_usd=%.2f  reason=%u",
+            id_res.value, (unsigned)sig.instr_id, (long)sig.qty_lots, sig.limit_price_usd,
+            (unsigned)risk_result);
         parent.state = OrderState::REJECTED;
         pool_.free_parent(id_res.value);
+
+        RejectReason reason = RejectReason::RISK_FAT_FINGER;
+        switch (risk_result) {
+            case RiskRejectReason::POSITION_LIMIT: reason = RejectReason::RISK_POSITION_LIMIT; break;
+            case RiskRejectReason::NOTIONAL:       reason = RejectReason::RISK_NOTIONAL;       break;
+            case RiskRejectReason::MARGIN:         reason = RejectReason::RISK_MARGIN;         break;
+            // FAT_FINGER and DISABLED (malformed instr_id) both fall through
+            // to RISK_FAT_FINGER, the closest fit: "this order as sent is bad".
+            default: break;
+        }
+        notify_reject(sig, reason);
         return;
     }
 
@@ -131,6 +146,7 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
             id_res.value, (unsigned)sig.instr_id, sig.limit_price_usd);
         parent.state = OrderState::REJECTED;
         pool_.free_parent(id_res.value);
+        notify_reject(sig, RejectReason::NO_LIQUIDITY);
         return;
     }
 
@@ -150,11 +166,10 @@ void ExecutionCore::build_routing_context(const ParentOrder&    parent,
     ctx.limit_price      = (parent.limit_price > 0)
         ? static_cast<double>(parent.limit_price) * cfg_.exchange_states[0].book.tick_size
         : 0.0;
-    // same per-instrument lot_size the risk engine uses for the notional check,
-    // one source of truth instead of two places assuming states[0]'s lot size.
-    // 0 here just means "not configured", RoutingContext falls back to
-    // states[0].book.lot_size on its own, same as leaving this field untouched.
-    ctx.reference_lot_size = cfg_.risk_limits.lot_size[parent.instr_id];
+    // same per-instrument lot_size the risk engine and notional gate use,
+    // one source of truth (InstrumentTable) instead of three places each
+    // assuming their own default.
+    ctx.reference_lot_size = cfg_.instruments.lot_size(parent.instr_id);
     ctx.short_vol_factor = 0.0;
     ctx.book_imbalance   = 0.0;
 }
@@ -254,6 +269,8 @@ void ExecutionCore::dispatch_child_orders(ParentOrder&                 parent,
             parent.parent_id, (long)parent.leaves_qty_lots, (long)parent.cum_qty_lots);
         parent.state = (parent.cum_qty_lots > 0) ? OrderState::PARTIALLY_FILLED
                                                   : OrderState::REJECTED;
+        notify_reject(parent.instr_id, parent.dir, parent.strategy_id,
+                     parent.leaves_qty_lots, RejectReason::CHILD_POOL_EXHAUSTED);
         pool_.free_parent(parent.parent_id);
     }
 }
@@ -280,9 +297,10 @@ void ExecutionCore::handle_fill(ChildOrderState&       child,
                                 ParentOrder&           parent,
                                 const ExecutionReport& rep) noexcept {
     const double tick_sz  = cfg_.exchange_states[child.exchange_id].book.tick_size;
-    const double lot_sz   = cfg_.exchange_states[child.exchange_id].book.lot_size;
     const double fill_px  = static_cast<double>(rep.fill_price_ticks) * tick_sz;
 
+    // child-level accounting stays in this child's native exchange lot units,
+    // that's what it was dispatched in and what the exchange reports fills in.
     child.cum_qty_lots   += rep.fill_qty_lots;
     child.leaves_qty_lots = child.qty_lots - child.cum_qty_lots;
     child.state = (child.leaves_qty_lots == 0)
@@ -298,28 +316,38 @@ void ExecutionCore::handle_fill(ChildOrderState&       child,
         (long)rep.fill_price_ticks,
         (long)child.leaves_qty_lots);
 
-    // update local margin estimate
-    margin_monitor_.on_fill(rep.fill_qty_lots, fill_px, cfg_.dashboard.lot_size);
+    // everything from here down is parent/instrument level, which lives in
+    // the instrument's canonical unit, not this child's native exchange lots.
+    // convert once, here, rather than let native quantities leak into
+    // cum_qty_lots/net_qty_lots/open_*_lots where they'd silently corrupt
+    // accounting the moment two exchanges for the same instrument disagree
+    // on lot size (see InstrumentTable in oms_types.hpp).
+    const double ref_lot_size   = cfg_.instruments.lot_size(parent.instr_id);
+    const qty_t  fill_canonical = to_canonical_lots(child, parent.instr_id, rep.fill_qty_lots);
 
-    parent.cum_qty_lots   += rep.fill_qty_lots;
-    parent.leaves_qty_lots = parent.total_qty_lots - parent.cum_qty_lots;
-    parent.last_update_ns  = rep.recv_ns;
+    // update local margin estimate
+    margin_monitor_.on_fill(fill_canonical, fill_px, ref_lot_size);
+
+    const qty_t prev_cum_lots = parent.cum_qty_lots;
+    parent.cum_qty_lots    += fill_canonical;
+    parent.leaves_qty_lots  = parent.total_qty_lots - parent.cum_qty_lots;
+    parent.last_update_ns   = rep.recv_ns;
 
     // running VWAP
-    const double prev_cum  = static_cast<double>(parent.cum_qty_lots - rep.fill_qty_lots) * lot_sz;
-    const double fill_qty  = static_cast<double>(rep.fill_qty_lots) * lot_sz;
-    const double total_cum = static_cast<double>(parent.cum_qty_lots) * lot_sz;
+    const double prev_cum  = static_cast<double>(prev_cum_lots)       * ref_lot_size;
+    const double fill_qty  = static_cast<double>(fill_canonical)      * ref_lot_size;
+    const double total_cum = static_cast<double>(parent.cum_qty_lots) * ref_lot_size;
     parent.avg_fill_price  = (prev_cum > 0.0)
         ? (parent.avg_fill_price * prev_cum + fill_px * fill_qty) / total_cum
         : fill_px;
 
-    pos_.instruments[parent.instr_id].apply_fill(parent.dir, rep.fill_qty_lots, fill_px);
-    pos_.instruments[parent.instr_id].release_open(parent.dir, rep.fill_qty_lots);
+    pos_.instruments[parent.instr_id].apply_fill(parent.dir, fill_canonical, fill_px);
+    pos_.instruments[parent.instr_id].release_open(parent.dir, fill_canonical);
 
     if (parent.leaves_qty_lots == 0) {
         g_log.info("PARENT_FILLED  parent_id=%u  avg_fill_px=%.4f  total_qty=%.4f",
             parent.parent_id, parent.avg_fill_price,
-            static_cast<double>(parent.total_qty_lots) * cfg_.dashboard.lot_size);
+            static_cast<double>(parent.total_qty_lots) * ref_lot_size);
         parent.state = OrderState::FILLED;
         for (uint8_t s = 0; s < ParentOrder::kMaxChildrenPerParent; ++s)
             if (parent.has_child(s)) pool_.free_child(parent.children[s]);
@@ -342,22 +370,27 @@ void ExecutionCore::handle_fill(ChildOrderState&       child,
 void ExecutionCore::handle_cancel_reject(ChildOrderState&       child,
                                          ParentOrder&           parent,
                                          const ExecutionReport& rep) noexcept {
-    const qty_t lost_lots  = child.leaves_qty_lots;
+    const qty_t lost_lots_native = child.leaves_qty_lots;  // this child's own exchange's native unit
     child.leaves_qty_lots  = 0;
     child.state = (rep.exec_type == ExecType::CANCELED)
         ? OrderState::CANCELED : OrderState::REJECTED;
 
+    // release_open()/pos_ are in the instrument's canonical unit, same
+    // conversion as handle_fill, see to_canonical_lots.
+    const double ref_lot_size    = cfg_.instruments.lot_size(parent.instr_id);
+    const qty_t  lost_canonical  = to_canonical_lots(child, parent.instr_id, lost_lots_native);
+
     timer_wheel_.cancel(child.child_id);
-    margin_monitor_.on_release(lost_lots,
+    margin_monitor_.on_release(lost_canonical,
         static_cast<double>(child.price) * cfg_.exchange_states[child.exchange_id].book.tick_size,
-        cfg_.dashboard.lot_size);
+        ref_lot_size);
 
     g_log.warn("CHILD_%s  child_id=%u  parent_id=%u  exchange=%u  lost_lots=%ld",
         (rep.exec_type == ExecType::CANCELED) ? "CANCELED" : "REJECTED",
         child.child_id, parent.parent_id,
-        (unsigned)child.exchange_id, (long)lost_lots);
+        (unsigned)child.exchange_id, (long)lost_lots_native);
 
-    pos_.instruments[parent.instr_id].release_open(parent.dir, lost_lots);
+    pos_.instruments[parent.instr_id].release_open(parent.dir, lost_canonical);
     parent.last_update_ns = rep.recv_ns;
 
     if (parent.leaves_qty_lots > 0) {
@@ -410,6 +443,8 @@ void ExecutionCore::reroute_leaves(ParentOrder& parent) noexcept {
             parent.parent_id, (long)parent.leaves_qty_lots, (long)parent.cum_qty_lots);
         parent.state = (parent.cum_qty_lots > 0) ? OrderState::PARTIALLY_FILLED
                                                   : OrderState::REJECTED;
+        notify_reject(parent.instr_id, parent.dir, parent.strategy_id,
+                     parent.leaves_qty_lots, RejectReason::NO_LIQUIDITY);
         pool_.free_parent(parent.parent_id);
         return;
     }
@@ -426,6 +461,34 @@ bool ExecutionCore::all_children_terminal(const ParentOrder& parent) const noexc
             return false;
     }
     return true;
+}
+
+qty_t ExecutionCore::to_canonical_lots(const ChildOrderState& child,
+                                       instr_id_t             instr_id,
+                                       qty_t                  native_lots) const noexcept {
+    const double native_lot_size = cfg_.exchange_states[child.exchange_id].book.lot_size;
+    const double ref_lot_size    = cfg_.instruments.lot_size(instr_id);
+    return static_cast<qty_t>(
+        std::round(static_cast<double>(native_lots) * native_lot_size / ref_lot_size));
+}
+
+void ExecutionCore::notify_reject(const StrategyOrderSignal& sig, RejectReason reason) noexcept {
+    notify_reject(sig.instr_id, sig.dir, sig.strategy_id, sig.qty_lots, reason);
+}
+
+void ExecutionCore::notify_reject(instr_id_t instr_id, sor::OrderDir dir, uint8_t strategy_id,
+                                  qty_t qty_lots, RejectReason reason) noexcept {
+    OrderReject rej{};
+    rej.qty_lots    = qty_lots;
+    rej.instr_id    = instr_id;
+    rej.dir         = dir;
+    rej.strategy_id = strategy_id;
+    rej.reason      = reason;
+    rej.reject_ns   = now_ns();
+
+    if (!reject_queue.push(rej)) [[unlikely]]
+        g_log.error("REJECT_QUEUE_FULL  instr=%u  reason=%u  DROPPED",
+            (unsigned)instr_id, (unsigned)reason);
 }
 
 } // namespace oms
