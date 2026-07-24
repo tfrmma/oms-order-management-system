@@ -6,6 +6,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# single source of truth for what belongs to each library. the ASan/UBSan
+# binary and the test binary both need these same files recompiled with
+# their own flags rather than linking sor_lib/oms_lib directly (those are
+# built without -fsanitize=..., and at a different -O level than tests want),
+# so the file LIST only has to be kept in sync here, once, instead of in
+# every target that needs its own copy.
+set(SOR_SOURCES sor/routing_engine.cpp)
+set(OMS_SOURCES oms/execution_core.cpp)
+
 add_library(hft_compile_flags INTERFACE)
 target_compile_options(hft_compile_flags INTERFACE
     $<$<CONFIG:Release>:-O3 -march=native -funroll-loops -fno-semantic-interposition>
@@ -18,14 +27,14 @@ target_compile_options(hft_compile_flags INTERFACE
 
 # ── SOR ───────────────────────────────────────────────────────────────────────
 add_library(sor_lib STATIC
-    sor/routing_engine.cpp
+    ${SOR_SOURCES}
 )
 target_include_directories(sor_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(sor_lib PUBLIC hft_compile_flags)
 
 # ── OMS ───────────────────────────────────────────────────────────────────────
 add_library(oms_lib STATIC
-    oms/execution_core.cpp
+    ${OMS_SOURCES}
 )
 # two include roots: project root (for "sor/...") and oms/ (for intra-OMS includes)
 target_include_directories(oms_lib PUBLIC
@@ -46,10 +55,13 @@ find_package(Threads REQUIRED)
 target_link_libraries(oms_lib PUBLIC Threads::Threads)
 
 # ── ASan + UBSan ──────────────────────────────────────────────────────────────
+# recompiles SOR_SOURCES/OMS_SOURCES with sanitizer flags instead of linking
+# sor_lib/oms_lib: those are built without -fsanitize=..., linking against
+# them here would leave library code uninstrumented and defeat the point.
 add_executable(oms_example_san
     oms_example.cpp
-    oms/execution_core.cpp
-    sor/routing_engine.cpp
+    ${OMS_SOURCES}
+    ${SOR_SOURCES}
 )
 target_include_directories(oms_example_san PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -68,10 +80,14 @@ add_library(catch2_lib STATIC tests/catch_amalgamated.cpp)
 target_include_directories(catch2_lib PUBLIC tests/)
 target_compile_options(catch2_lib PRIVATE -O1 -fno-exceptions -fno-rtti)
 
+# recompiles SOR_SOURCES/OMS_SOURCES at a fixed -O1 -g instead of linking
+# sor_lib/oms_lib: keeps test build time and behavior independent of whatever
+# CMAKE_BUILD_TYPE is active (Release's -march=native would tie test runs to
+# the local CPU's ISA for no benefit, Debug's -O0 would make them slow).
 add_executable(oms_tests
     tests/test_oms.cpp
-    sor/routing_engine.cpp
-    oms/execution_core.cpp
+    ${SOR_SOURCES}
+    ${OMS_SOURCES}
 )
 target_include_directories(oms_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
