@@ -461,19 +461,26 @@ Constants were calibrated against internal fill data. Recalibrate for your excha
   exchanges for the same instrument disagreed on lot size. Now there's one
   `InstrumentTable`, and `ExecutionCore::to_canonical_lots` converts every
   fill through it before touching parent or position state.
-- **Found while re-verifying the above, not fixed, unrelated to any of it:**
-  `oms_example.cpp`'s demo dispatches 11 children within nanoseconds of each
-  other, all with the same `child_timeout_ns` deadline, and `TimerWheel`'s
-  per-slot capacity is 8 (`kSlotDepth`). Three of them log `SLOT_FULL` and
-  fall back to "treating as timeout" immediately instead of actually waiting
-  out the 2-second window. Harmless for the demo, a real venue with actual
-  network latency won't dispatch this many orders in the same microsecond,
-  but it's a real gap for anyone who does burst that hard, worth either
-  raising `kSlotDepth` or spreading same-tick deadlines across neighboring
-  slots. Only surfaced now because every earlier verification run redirected
+- **Fixed:** `oms_example.cpp`'s demo dispatches 11 children within
+  nanoseconds of each other, all with the same `child_timeout_ns` deadline,
+  and `TimerWheel`'s per-slot capacity was 8 (`kSlotDepth`). Three of them
+  used to log `SLOT_FULL` and fall back to "treating as timeout" immediately
+  instead of actually waiting out the 2-second window. Raised `kSlotDepth`
+  to 32, justified against `ParentOrder::kMaxChildrenPerParent` (16, the real
+  ceiling for one order's dispatch burst) instead of the old comment's vague
+  "handles bursts" claim, which it didn't. Only surfaced because every
+  earlier verification run in this README's own history redirected
   `oms_example`'s stderr to `/dev/null` and only checked the exit code.
 - No maker routing. 100% taker.
-- `oms_example_san` duplicates sources instead of linking `sor_lib`/`oms_lib`, easy to forget to update if a new file gets added to either.
+- **Fixed:** `oms_example_san` and `oms_tests` both used to hardcode their
+  own copy of `sor/routing_engine.cpp` + `oms/execution_core.cpp` instead of
+  linking `sor_lib`/`oms_lib`, because they genuinely need different compile
+  flags (sanitizers, or a fixed `-O1` independent of `CMAKE_BUILD_TYPE`) than
+  those libraries are built with, linking the prebuilt libs would've left
+  them uninstrumented or tied to the wrong optimization level. `SOR_SOURCES`
+  and `OMS_SOURCES` are now CMake list variables defined once, every target
+  that needs its own recompile references the same list instead of
+  maintaining a separate copy that can drift.
 
 ---
 
