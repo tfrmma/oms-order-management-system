@@ -289,4 +289,93 @@ SplitResult RoutingEngine::calculate_optimal_split(
     return greedy_fill(workspace_, ctx, out);
 }
 
+SplitResult RoutingEngine::calculate_maker_placement(
+    const RoutingContext& ctx,
+    ChildOrderBuffer&     out
+) noexcept {
+    assert(ctx.states           != nullptr);
+    assert(ctx.target_lots      >  0);
+    assert(ctx.active_exchanges <= kMaxExchanges);
+    assert(out.count            == 0);
+
+    SplitResult result{};
+
+    const bool    is_buy   = (ctx.dir == OrderDir::BUY);
+    // BUY posts on the bid, SELL posts on the ask, mirror image of which
+    // side calculate_optimal_split reads for the same direction.
+    const uint8_t side_idx = is_buy ? static_cast<uint8_t>(Side::BID) : static_cast<uint8_t>(Side::ASK);
+    const uint8_t opp_idx  = is_buy ? static_cast<uint8_t>(Side::ASK) : static_cast<uint8_t>(Side::BID);
+    const int64_t dir_sign = is_buy ? 1 : -1;
+
+    // same "lower effective_ticks always wins" convention as build_cost_slices,
+    // just without a latency penalty term, a resting order isn't racing anyone.
+    // fees_.maker() can be negative (a rebate), which naturally pulls eff_ticks
+    // down (more attractive) without any special-casing.
+    const ExchangeState* best_state    = nullptr;
+    price_t              best_raw_ticks = 0;
+    int64_t              best_eff_ticks  = 0;
+
+    for (uint32_t ex = 0; ex < ctx.active_exchanges; ++ex) {
+        const ExchangeState& state = ctx.states[ex];
+        if (!state.enabled || !state.book.is_valid) [[unlikely]] continue;
+
+        const LevelSide& touch_side = state.book.sides[side_idx];
+        if (touch_side.count == 0) [[unlikely]] continue;  // nothing to post against
+
+        const price_t raw_ticks = touch_side.price_ticks[0];
+
+        if (ctx.limit_price > 0.0) {
+            const auto limit_ticks = static_cast<price_t>(
+                std::llround(ctx.limit_price / state.book.tick_size));
+            // don't post somewhere already worse than the caller will pay/accept
+            if (dir_sign > 0 ? (raw_ticks > limit_ticks) : (raw_ticks < limit_ticks))
+                continue;
+        }
+
+        const auto fee_ticks = static_cast<int64_t>(
+            std::llround(static_cast<double>(raw_ticks) * fees_.maker(state.exchange_id)));
+        const int64_t eff_ticks = dir_sign * raw_ticks + fee_ticks;
+
+        if (best_state == nullptr || eff_ticks < best_eff_ticks) {
+            best_state     = &state;
+            best_raw_ticks = raw_ticks;
+            best_eff_ticks = eff_ticks;
+        }
+    }
+
+    if (best_state == nullptr) [[unlikely]] return result;  // success = false, nothing else set
+
+    const double ref_lot_size = resolve_reference_lot_size(ctx);
+    const double tick_size    = best_state->book.tick_size;
+
+    ChildOrder& co    = out.orders[0];
+    co.exchange_id    = best_state->exchange_id;
+    co.level_idx      = 0;
+    co.price          = static_cast<double>(best_raw_ticks) * tick_size;
+    co.qty            = static_cast<double>(ctx.target_lots) * ref_lot_size;
+    co.type           = OrderType::MAKER;
+    co.dir            = ctx.dir;
+    co.effective_cost = static_cast<double>(best_eff_ticks) * tick_size;
+    out.count = 1;
+
+    result.success              = true;
+    result.child_count          = 1;
+    result.filled_qty           = 0.0;    // posted, not filled, fills arrive later as execution reports
+    result.unfilled_qty         = co.qty;
+    result.avg_effective_price  = co.effective_cost;
+    result.total_effective_cost = co.effective_cost * co.qty;
+
+    // spread_capture_bps: distance from the posted price to the opposite
+    // touch on the same book, in bps. how much of the spread this placement
+    // is positioned to capture versus crossing it right now.
+    const LevelSide& opp_side = best_state->book.sides[opp_idx];
+    if (opp_side.count > 0 && best_raw_ticks != 0) [[likely]] {
+        const price_t cross_ticks = opp_side.price_ticks[0];
+        const double  tick_diff   = static_cast<double>(std::llabs(cross_ticks - best_raw_ticks));
+        result.spread_capture_bps = (tick_diff / static_cast<double>(std::llabs(best_raw_ticks))) * 10000.0;
+    }
+
+    return result;
+}
+
 } // namespace sor
