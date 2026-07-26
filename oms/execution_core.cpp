@@ -41,6 +41,15 @@ ExecutionCore::ExecutionCore(const ExecCoreConfig& cfg) noexcept
         on_execution_report(rep);
     });
 
+    // TimerWheel's internal clock defaults to 0. tick(now) advances it
+    // tick_ns_ (1ms) at a time until it reaches now, so without this, the
+    // first ever tick() call would try to walk from 0 up to the real epoch,
+    // ~1.7e18 ns away, roughly 1.7e12 iterations. that's not a slow start,
+    // it's an effectively permanent hang the moment run() is ever actually
+    // called for real. reset_clock() already existed for exactly this,
+    // nothing was calling it.
+    timer_wheel_.reset_clock(now_ns());
+
     dashboard_.start();
     g_log.info("EXEC_CORE  INIT  exchanges=%u  child_timeout_ns=%lu",
                cfg_.active_exchanges, (unsigned long)cfg_.child_timeout_ns);
@@ -48,24 +57,26 @@ ExecutionCore::ExecutionCore(const ExecCoreConfig& cfg) noexcept
 
 void ExecutionCore::run() noexcept {
     running_ = true;
+    while (__builtin_expect(running_, 1)) {
+        tick(now_ns());
+        __builtin_ia32_pause();
+    }
+}
+
+void ExecutionCore::tick(uint64_t now) noexcept {
     StrategyOrderSignal sig{};
     ExecutionReport     rep{};
 
-    while (__builtin_expect(running_, 1)) {
-        const uint64_t now = now_ns();
-        while (strategy_queue.pop(sig))
-            on_strategy_order(sig);
-        while (exec_report_queue.pop(rep))
-            on_execution_report(rep);
+    while (strategy_queue.pop(sig))
+        on_strategy_order(sig);
+    while (exec_report_queue.pop(rep))
+        on_execution_report(rep);
 
-        timer_wheel_.tick(now);
+    timer_wheel_.tick(now);
 
-        // check margin warnings every ~1s (cheap, just reads atomics)
-        if ((now & 0x3FFF'FFFF) == 0) [[unlikely]]
-            margin_monitor_.check_warnings(now);
-
-        __builtin_ia32_pause();
-    }
+    // check margin warnings every ~1s (cheap, just reads atomics)
+    if ((now & 0x3FFF'FFFF) == 0) [[unlikely]]
+        margin_monitor_.check_warnings(now);
 }
 
 void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
@@ -92,13 +103,14 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
     }
 
     ParentOrder& parent = pool_.parent(id_res.value);
-    parent.instr_id        = sig.instr_id;
-    parent.dir             = sig.dir;
-    parent.total_qty_lots  = sig.qty_lots;
-    parent.leaves_qty_lots = sig.qty_lots;
-    parent.strategy_id     = sig.strategy_id;
-    parent.create_ns       = sig.signal_ns ? sig.signal_ns : now_ns();
-    parent.state           = OrderState::NEW;
+    parent.instr_id         = sig.instr_id;
+    parent.dir               = sig.dir;
+    parent.order_type        = sig.order_type;
+    parent.total_qty_lots   = sig.qty_lots;
+    parent.leaves_qty_lots  = sig.qty_lots;
+    parent.strategy_id      = sig.strategy_id;
+    parent.create_ns        = sig.signal_ns ? sig.signal_ns : now_ns();
+    parent.state            = OrderState::NEW;
 
     // all exchanges share the same tick size in this universe. if that changes,
     // this needs to be per-instrument. not today's problem.
@@ -134,10 +146,14 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
     routing_ctx_.decision_ns      = now_ns();
 
     child_buf_.reset();
-    const sor::SplitResult split = sor_.calculate_optimal_split(routing_ctx_, child_buf_);
+    const sor::SplitResult split = (sig.order_type == sor::OrderType::MAKER)
+        ? sor_.calculate_maker_placement(routing_ctx_, child_buf_)
+        : sor_.calculate_optimal_split(routing_ctx_, child_buf_);
 
-    g_log.info("SOR_RESULT  parent_id=%u  children=%u  filled_qty=%.4f  unfilled=%.4f  avg_px=%.2f  success=%d",
-        id_res.value, child_buf_.count,
+    g_log.info("SOR_RESULT  parent_id=%u  style=%s  children=%u  filled_qty=%.4f  unfilled=%.4f  avg_px=%.2f  success=%d",
+        id_res.value,
+        (sig.order_type == sor::OrderType::MAKER) ? "MAKER" : "TAKER",
+        child_buf_.count,
         split.filled_qty, split.unfilled_qty,
         split.avg_effective_price, (int)split.success);
 
@@ -216,8 +232,14 @@ void ExecutionCore::dispatch_child_orders(ParentOrder&                 parent,
             (long)child.qty_lots,
             (long)child.price);
 
-        // start the cancel-on-timeout clock
-        timer_wheel_.insert(cid_res.value, ts, cfg_.child_timeout_ns);
+        // maker children get the longer, separate maker_timeout_ns clock,
+        // taker children get the short ack/fill-oriented child_timeout_ns.
+        // same TimerWheel, same callback, same reroute_leaves() on expiry
+        // either way, only the duration differs.
+        const uint64_t timeout_ns = (co.type == sor::OrderType::MAKER)
+            ? cfg_.maker_timeout_ns
+            : cfg_.child_timeout_ns;
+        timer_wheel_.insert(cid_res.value, ts, timeout_ns);
 
         OutboundOrder out{};
         out.child_id    = cid_res.value;
