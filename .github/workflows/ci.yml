@@ -49,8 +49,11 @@ jobs:
       - name: Configure (Debug, sanitizers only build under this config)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 
-      - name: Build ASan/UBSan target
-        run: cmake --build build --target oms_example_san --parallel
+      - name: Build ASan/UBSan targets
+        run: cmake --build build --target oms_example_san oms_tests_san --parallel
 
-      - name: Run under ASan/UBSan
+      - name: Run demo under ASan/UBSan
         run: echo "yes" | ./build/oms_example_san
+
+      - name: Run test suite under ASan/UBSan
+        run: ./build/oms_tests_san
