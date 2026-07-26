@@ -1,6 +1,11 @@
-// unit tests for the pieces that don't need a live ExecutionCore: the SOR
-// merge/fill algorithm, the order pool, position tracking, pre-trade risk,
-// the SPSC queue, and the timer wheel.
+// unit tests for the SOR merge/fill algorithm, the order pool, position
+// tracking, pre-trade risk, the SPSC queue, and the timer wheel, plus
+// integration tests that drive a real ExecutionCore end to end through its
+// public API (on_strategy_order/on_execution_report/tick), not mocks.
+//
+// ExecutionCore is a few MB (OMSOrderPool + TimerWheel dominate), heap-
+// allocate it via std::make_unique like the README's own usage example
+// does, don't put it on the stack.
 //
 // tick_size = lot_size = 1.0 everywhere here on purpose: price_ticks == price
 // and qty_lots == qty, so expected values are exact integers instead of
@@ -8,6 +13,7 @@
 // field means for anyone who wants a book with realistic tick/lot sizes.
 
 #include "catch_amalgamated.hpp"
+#include <cstdio>
 
 #include "sor/routing_engine.hpp"
 #include "order_pool.hpp"
@@ -17,6 +23,8 @@
 #include "timer_wheel.hpp"
 #include "execution_core.hpp"
 
+#include <chrono>
+#include <memory>
 #include <vector>
 
 using namespace sor;
@@ -60,6 +68,18 @@ RoutingContext make_context(ExchangeState* states, uint32_t n_exchanges,
     ctx.target_lots       = target_lots;
     ctx.limit_price       = limit_price;
     return ctx;
+}
+
+// ExecutionCore's internal now_ns() reads CLOCK_REALTIME (see execution_core.cpp),
+// which is what dispatch_child_orders stamps a child's sent_ns with before
+// inserting it into the timer wheel. tests that drive ExecutionCore::tick()
+// manually need timestamps on that same clock, std::chrono::system_clock
+// maps to CLOCK_REALTIME on glibc, small fixed numbers like 1000 don't mean
+// anything to a timer wheel whose deadlines are computed from the real epoch.
+uint64_t real_now_ns() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
 } // namespace
@@ -230,6 +250,119 @@ TEST_CASE("RoutingEngine: reference_lot_size reconciles exchanges with different
     // filled_qty must equal target exactly, never exceed it
     REQUIRE(r.filled_qty   == Catch::Approx(25.0));
     REQUIRE(r.unfilled_qty == Catch::Approx(0.0));
+}
+
+TEST_CASE("RoutingEngine: maker BUY posts on the bid side, not the ask") {
+    ExchangeState ex{};
+    init_exchange(ex, 0);
+    set_levels(ex.book.bids(), {{99, 10}});
+    set_levels(ex.book.asks(), {{101, 10}});
+
+    FeeMatrix fees{};
+    RoutingEngine engine(fees);
+    ChildOrderBuffer out;
+    const SplitResult r = engine.calculate_maker_placement(
+        make_context(&ex, 1, OrderDir::BUY, 5), out);
+
+    REQUIRE(r.success);
+    REQUIRE(r.child_count == 1);
+    REQUIRE(out.orders[0].price == Catch::Approx(99.0));   // the bid, not the ask
+    REQUIRE(out.orders[0].qty   == Catch::Approx(5.0));
+    REQUIRE(out.orders[0].type  == OrderType::MAKER);
+    REQUIRE(out.orders[0].dir   == OrderDir::BUY);
+    // nothing fills at placement time, it's a resting order
+    REQUIRE(r.filled_qty   == Catch::Approx(0.0));
+    REQUIRE(r.unfilled_qty == Catch::Approx(5.0));
+}
+
+TEST_CASE("RoutingEngine: maker SELL posts on the ask side, not the bid") {
+    ExchangeState ex{};
+    init_exchange(ex, 0);
+    set_levels(ex.book.bids(), {{99, 10}});
+    set_levels(ex.book.asks(), {{101, 10}});
+
+    FeeMatrix fees{};
+    RoutingEngine engine(fees);
+    ChildOrderBuffer out;
+    const SplitResult r = engine.calculate_maker_placement(
+        make_context(&ex, 1, OrderDir::SELL, 5), out);
+
+    REQUIRE(r.success);
+    REQUIRE(out.orders[0].price == Catch::Approx(101.0));  // the ask, not the bid
+    REQUIRE(out.orders[0].type  == OrderType::MAKER);
+}
+
+TEST_CASE("RoutingEngine: maker picks the exchange with the best fee-adjusted price") {
+    // both exchanges quote the identical raw bid, but exchange 1 pays a 1%
+    // maker rebate, exchange 0 charges a flat 0% maker fee. same touch price,
+    // different net economics, the rebate should win even though the raw
+    // price is tied.
+    ExchangeState ex[2]{};
+    init_exchange(ex[0], 0);
+    init_exchange(ex[1], 1);
+    set_levels(ex[0].book.bids(), {{100, 10}});
+    set_levels(ex[1].book.bids(), {{100, 10}});
+
+    FeeMatrix fees{};
+    fees.rates[0][0] = 0.0;    // exchange 0 maker fee: flat
+    fees.rates[1][0] = -0.01;  // exchange 1 maker fee: 1% rebate
+
+    RoutingEngine engine(fees);
+    ChildOrderBuffer out;
+    const SplitResult r = engine.calculate_maker_placement(
+        make_context(ex, 2, OrderDir::BUY, 5), out);
+
+    REQUIRE(r.success);
+    REQUIRE(out.orders[0].exchange_id == 1);  // the rebate venue, not index 0
+}
+
+TEST_CASE("RoutingEngine: maker won't post through the caller's limit price") {
+    ExchangeState ex{};
+    init_exchange(ex, 0);
+    set_levels(ex.book.bids(), {{100, 10}});
+
+    FeeMatrix fees{};
+    RoutingEngine engine(fees);
+    ChildOrderBuffer out;
+    // willing to pay at most 95, but the current best bid is 100, posting
+    // there would mean paying more than the limit if it fills
+    const SplitResult r = engine.calculate_maker_placement(
+        make_context(&ex, 1, OrderDir::BUY, 5, /*limit_price=*/95.0), out);
+
+    REQUIRE_FALSE(r.success);
+    REQUIRE(out.count == 0);
+}
+
+TEST_CASE("RoutingEngine: maker fails cleanly when no exchange has a touch to post against") {
+    ExchangeState ex{};
+    init_exchange(ex, 0);
+    // bid side left empty on purpose, nothing to post a BUY maker against
+
+    FeeMatrix fees{};
+    RoutingEngine engine(fees);
+    ChildOrderBuffer out;
+    const SplitResult r = engine.calculate_maker_placement(
+        make_context(&ex, 1, OrderDir::BUY, 5), out);
+
+    REQUIRE_FALSE(r.success);
+    REQUIRE(out.count == 0);
+}
+
+TEST_CASE("RoutingEngine: maker reports spread_capture_bps against the opposite touch") {
+    ExchangeState ex{};
+    init_exchange(ex, 0);
+    set_levels(ex.book.bids(), {{100, 10}});
+    set_levels(ex.book.asks(), {{102, 10}});
+
+    FeeMatrix fees{};
+    RoutingEngine engine(fees);
+    ChildOrderBuffer out;
+    const SplitResult r = engine.calculate_maker_placement(
+        make_context(&ex, 1, OrderDir::BUY, 5), out);
+
+    REQUIRE(r.success);
+    // (102-100)/100 * 10000 = 200 bps
+    REQUIRE(r.spread_capture_bps == Catch::Approx(200.0));
 }
 
 TEST_CASE("OMSOrderPool: alloc/free is LIFO") {
@@ -466,7 +599,7 @@ TEST_CASE("ExecutionCore: undispatched children release their margin reservation
     cfg.notional_gate.auto_approve_usd = 1e12;  // market orders skip the gate anyway (limit_price_usd = 0)
     cfg.dashboard.enabled              = false; // no need for a live snapshot thread in a unit test
 
-    ExecutionCore core(cfg);
+    auto core = std::make_unique<ExecutionCore>(cfg);
 
     StrategyOrderSignal filler{};
     filler.instr_id = 0;
@@ -475,25 +608,25 @@ TEST_CASE("ExecutionCore: undispatched children release their margin reservation
 
     // pack the child pool with full 16-child parents, stop with fewer than
     // 16 slots left so the next 16-lot order can't fully dispatch
-    while (core.pool().children_in_use() + 16 <= kMaxTotalChildren - 11)
-        core.on_strategy_order(filler);
+    while (core->pool().children_in_use() + 16 <= kMaxTotalChildren - 11)
+        core->on_strategy_order(filler);
 
     // top up to exactly 11 free slots with a smaller filler (sweeps only
     // the first 5 levels), landing on a number that isn't a multiple of 16
     StrategyOrderSignal small_filler = filler;
     small_filler.qty_lots = 5;
-    core.on_strategy_order(small_filler);
+    core->on_strategy_order(small_filler);
 
-    const uint32_t used_before    = core.pool().children_in_use();
+    const uint32_t used_before    = core->pool().children_in_use();
     const uint32_t free_before    = kMaxTotalChildren - used_before;
-    const int64_t  open_before    = core.positions().instruments[0].open_buy_lots.load();
+    const int64_t  open_before    = core->positions().instruments[0].open_buy_lots.load();
     REQUIRE(free_before < 16);
     REQUIRE(free_before > 0);
 
     // this 16-lot order can only get free_before children out the door
-    core.on_strategy_order(filler);
+    core->on_strategy_order(filler);
 
-    const uint32_t dispatched = core.pool().children_in_use() - used_before;
+    const uint32_t dispatched = core->pool().children_in_use() - used_before;
     REQUIRE(dispatched == free_before);   // took exactly what was available, no more
     REQUIRE(dispatched < 16);             // proves the gap actually happened
     REQUIRE(dispatched > 0);              // and it wasn't a total failure either
@@ -501,14 +634,14 @@ TEST_CASE("ExecutionCore: undispatched children release their margin reservation
     // the open-order reservation grew by exactly what got dispatched, not by
     // the full 16 lots the signal asked for, this is the actual fix: before
     // it, this would still show +16 (the gap's margin leaked, never released)
-    const int64_t open_after = core.positions().instruments[0].open_buy_lots.load();
+    const int64_t open_after = core->positions().instruments[0].open_buy_lots.load();
     REQUIRE(open_after - open_before == static_cast<int64_t>(dispatched));
 
     // and the parent itself must not be orphaned: it's still tracked, holding
     // exactly the children that got dispatched, waiting on those to terminate
     // so a later reroute can pick up the gap (DISPATCH_GAP doesn't shrink
     // leaves_qty_lots on purpose, see the comment at the call site)
-    REQUIRE(core.pool().parents_in_use() > 0);
+    REQUIRE(core->pool().parents_in_use() > 0);
 }
 
 TEST_CASE("ExecutionCore: a parent whose last dispatched child fills still gets rerouted for its gap") {
@@ -536,16 +669,16 @@ TEST_CASE("ExecutionCore: a parent whose last dispatched child fills still gets 
     cfg.notional_gate.auto_approve_usd = 1e12;
     cfg.dashboard.enabled              = false;
 
-    ExecutionCore core(cfg);
+    auto core = std::make_unique<ExecutionCore>(cfg);
 
     StrategyOrderSignal sig{};
     sig.instr_id = 0;
     sig.dir      = OrderDir::BUY;
     sig.qty_lots = 20;
 
-    core.on_strategy_order(sig);
-    REQUIRE(core.pool().parents_in_use()  == 1);
-    REQUIRE(core.pool().children_in_use() == 16);  // capped, 4-lot gap parked in leaves_qty_lots
+    core->on_strategy_order(sig);
+    REQUIRE(core->pool().parents_in_use()  == 1);
+    REQUIRE(core->pool().children_in_use() == 16);  // capped, 4-lot gap parked in leaves_qty_lots
 
     // fill all 16 dispatched children. LIFO alloc on a fresh pool is
     // deterministic: the only parent this test ever creates is id 0, and its
@@ -558,7 +691,7 @@ TEST_CASE("ExecutionCore: a parent whose last dispatched child fills still gets 
         rep.fill_qty_lots   = 1;
         rep.fill_price_ticks = 100 + static_cast<price_t>(cid);
         rep.recv_ns          = 1;
-        core.on_execution_report(rep);
+        core->on_execution_report(rep);
     }
 
     // without the handle_fill fix: all 16 children are now FILLED and freed,
@@ -568,9 +701,9 @@ TEST_CASE("ExecutionCore: a parent whose last dispatched child fills still gets 
     // all_children_terminal() check (parent.leaves_qty_lots=4, all children
     // terminal) triggers reroute_leaves(), which dispatches fresh children
     // for the gap instead.
-    REQUIRE(core.pool().children_in_use() == 4);
-    REQUIRE(core.pool().parents_in_use()  == 1);  // same parent, still tracked, not orphaned
-    REQUIRE(core.positions().instruments[0].net_qty_lots.load() == 16);
+    REQUIRE(core->pool().children_in_use() == 4);
+    REQUIRE(core->pool().parents_in_use()  == 1);  // same parent, still tracked, not orphaned
+    REQUIRE(core->positions().instruments[0].net_qty_lots.load() == 16);
 }
 
 TEST_CASE("ExecutionCore: fills from exchanges with different native lot sizes convert to canonical units") {
@@ -598,15 +731,15 @@ TEST_CASE("ExecutionCore: fills from exchanges with different native lot sizes c
     cfg.notional_gate.auto_approve_usd = 1e12;
     cfg.dashboard.enabled              = false;
 
-    ExecutionCore core(cfg);
+    auto core = std::make_unique<ExecutionCore>(cfg);
 
     StrategyOrderSignal sig{};
     sig.instr_id = 0;
     sig.dir      = OrderDir::BUY;
     sig.qty_lots = 18;   // 10 from exchange 0 (its full depth) + 8 real units from exchange 1
 
-    core.on_strategy_order(sig);
-    REQUIRE(core.pool().children_in_use() == 2);
+    core->on_strategy_order(sig);
+    REQUIRE(core->pool().children_in_use() == 2);
 
     // deterministic ids on a fresh pool: child 0 is exchange 0's leg (10 real
     // units, native lot_size 1.0 so native == canonical == 10), child 1 is
@@ -618,7 +751,7 @@ TEST_CASE("ExecutionCore: fills from exchanges with different native lot sizes c
     fill0.fill_qty_lots   = 10;   // native, exchange 0
     fill0.fill_price_ticks = 100;
     fill0.recv_ns          = 1;
-    core.on_execution_report(fill0);
+    core->on_execution_report(fill0);
 
     ExecutionReport fill1{};
     fill1.child_id        = 1;
@@ -627,15 +760,15 @@ TEST_CASE("ExecutionCore: fills from exchanges with different native lot sizes c
     fill1.fill_qty_lots   = 2;    // native, exchange 1: 2 native lots * 4.0 = 8 real units
     fill1.fill_price_ticks = 101;
     fill1.recv_ns          = 1;
-    core.on_execution_report(fill1);
+    core->on_execution_report(fill1);
 
     // 10 (native==canonical on exchange 0) + 8 (2 native lots * 4.0 lot_size,
     // converted) = 18 canonical units, exactly the original order size.
     // before the fix this would read 10 + 2 = 12: exchange 1's native lot
     // count summed directly instead of converted to real units first.
-    REQUIRE(core.positions().instruments[0].net_qty_lots.load() == 18);
-    REQUIRE(core.pool().parents_in_use()  == 0);  // fully filled, freed
-    REQUIRE(core.pool().children_in_use() == 0);
+    REQUIRE(core->positions().instruments[0].net_qty_lots.load() == 18);
+    REQUIRE(core->pool().parents_in_use()  == 0);  // fully filled, freed
+    REQUIRE(core->pool().children_in_use() == 0);
 }
 
 TEST_CASE("ExecutionCore: rejected signals land on reject_queue with the right reason") {
@@ -653,20 +786,20 @@ TEST_CASE("ExecutionCore: rejected signals land on reject_queue with the right r
     SECTION("risk fat-finger reject") {
         cfg.risk_limits.max_order_lots[0]  = 5;
         cfg.notional_gate.auto_approve_usd = 1e12;
-        ExecutionCore core(cfg);
+        auto core = std::make_unique<ExecutionCore>(cfg);
 
         StrategyOrderSignal sig{};
         sig.instr_id = 0;
         sig.dir      = OrderDir::BUY;
         sig.qty_lots = 500;  // way over max_order_lots
-        core.on_strategy_order(sig);
+        core->on_strategy_order(sig);
 
         OrderReject rej{};
-        REQUIRE(core.reject_queue.pop(rej));
+        REQUIRE(core->reject_queue.pop(rej));
         REQUIRE(rej.reason      == RejectReason::RISK_FAT_FINGER);
         REQUIRE(rej.instr_id    == 0);
         REQUIRE(rej.qty_lots    == 500);
-        REQUIRE(core.pool().parents_in_use() == 0);  // never made it past risk, freed
+        REQUIRE(core->pool().parents_in_use() == 0);  // never made it past risk, freed
     }
 
     SECTION("no liquidity reject") {
@@ -675,34 +808,138 @@ TEST_CASE("ExecutionCore: rejected signals land on reject_queue with the right r
         ExchangeState empty{};
         init_exchange(empty, 0);  // valid book, zero levels: no liquidity, not a bad book
         cfg.exchange_states = &empty;
-        ExecutionCore core(cfg);
+        auto core = std::make_unique<ExecutionCore>(cfg);
 
         StrategyOrderSignal sig{};
         sig.instr_id = 0;
         sig.dir      = OrderDir::BUY;
         sig.qty_lots = 10;
-        core.on_strategy_order(sig);
+        core->on_strategy_order(sig);
 
         OrderReject rej{};
-        REQUIRE(core.reject_queue.pop(rej));
+        REQUIRE(core->reject_queue.pop(rej));
         REQUIRE(rej.reason == RejectReason::NO_LIQUIDITY);
     }
 
     SECTION("notional gate hard block") {
         cfg.risk_limits.max_order_lots[0]  = 100'000;
         cfg.notional_gate.hard_block_usd   = 1'000.0;
-        ExecutionCore core(cfg);
+        auto core = std::make_unique<ExecutionCore>(cfg);
 
         StrategyOrderSignal sig{};
         sig.instr_id        = 0;
         sig.dir              = OrderDir::BUY;
         sig.qty_lots         = 100;
         sig.limit_price_usd  = 500.0;  // 100 * 1.0 * 500 = 50,000 USD, way over the 1,000 hard block
-        core.on_strategy_order(sig);
+        core->on_strategy_order(sig);
 
         OrderReject rej{};
-        REQUIRE(core.reject_queue.pop(rej));
+        REQUIRE(core->reject_queue.pop(rej));
         REQUIRE(rej.reason == RejectReason::NOTIONAL_GATE_BLOCK);
-        REQUIRE(core.pool().parents_in_use() == 0);  // blocked before any parent was even allocated
+        REQUIRE(core->pool().parents_in_use() == 0);  // blocked before any parent was even allocated
     }
+}
+
+TEST_CASE("ExecutionCore: maker order posts passively, then sweeps as taker if unfilled by maker_timeout_ns") {
+    ExchangeState ex{};
+    init_exchange(ex, 0);
+    set_levels(ex.book.bids(), {{100, 10}});   // maker BUY posts here
+    set_levels(ex.book.asks(), {{102, 20}});   // taker sweep lands here if it happens
+
+    ExecCoreConfig cfg{};
+    cfg.exchange_states  = &ex;
+    cfg.active_exchanges = 1;
+    cfg.risk_limits.max_order_lots[0]  = 1000;
+    cfg.risk_limits.max_net_lots[0]    = 1000;
+    cfg.instruments.instruments[0].lot_size = 1.0;
+    cfg.margin.equity_usd              = 1e9;
+    cfg.notional_gate.auto_approve_usd = 1e12;
+    cfg.dashboard.enabled              = false;
+    cfg.maker_timeout_ns               = 5'000'000ULL;  // 5ms, short so the test stays fast
+
+    auto core = std::make_unique<ExecutionCore>(cfg);
+
+    StrategyOrderSignal sig{};
+    sig.instr_id   = 0;
+    sig.dir        = OrderDir::BUY;
+    sig.qty_lots   = 8;
+    sig.order_type = OrderType::MAKER;
+
+    core->on_strategy_order(sig);
+
+    // posted, not filled, resting passively at the touch
+    REQUIRE(core->pool().parents_in_use()  == 1);
+    REQUIRE(core->pool().children_in_use() == 1);
+    REQUIRE(core->pool().child(0).order_type == OrderType::MAKER);
+    REQUIRE(core->pool().child(0).price      == Catch::Approx(100.0));
+    REQUIRE(core->pool().parent(0).order_type == OrderType::MAKER);
+    REQUIRE(core->pool().parent(0).state      == OrderState::PENDING_NEW);
+
+    // well before the deadline: still resting, untouched
+    core->tick(real_now_ns() + 1'000ULL);
+    REQUIRE(core->pool().child(0).state == OrderState::PENDING_NEW);
+    REQUIRE(core->pool().children_in_use() == 1);
+
+    // past maker_timeout_ns with no fill ever arriving
+    core->tick(real_now_ns() + cfg.maker_timeout_ns + 1'000'000ULL);
+
+    // the timed-out maker child got canceled and freed, and reroute_leaves
+    // swept the remainder as taker, landing on the ask liquidity. LIFO free
+    // list means the new child reuses the same id the canceled one just
+    // vacated, not a fresh one, that's not a bug, see OMSOrderPool.
+    REQUIRE(core->pool().children_in_use() == 1);
+    REQUIRE(core->pool().child(0).order_type == OrderType::TAKER);
+    REQUIRE(core->pool().child(0).price      == Catch::Approx(102.0));
+    REQUIRE(core->pool().child(0).qty_lots   == 8);
+
+    // the parent remembers how it started, reroute_leaves doesn't rewrite that
+    REQUIRE(core->pool().parent(0).order_type == OrderType::MAKER);
+}
+
+TEST_CASE("ExecutionCore: maker order that fills before the timeout never sweeps") {
+    ExchangeState ex{};
+    init_exchange(ex, 0);
+    set_levels(ex.book.bids(), {{100, 10}});
+    set_levels(ex.book.asks(), {{102, 20}});
+
+    ExecCoreConfig cfg{};
+    cfg.exchange_states  = &ex;
+    cfg.active_exchanges = 1;
+    cfg.risk_limits.max_order_lots[0]  = 1000;
+    cfg.risk_limits.max_net_lots[0]    = 1000;
+    cfg.instruments.instruments[0].lot_size = 1.0;
+    cfg.margin.equity_usd              = 1e9;
+    cfg.notional_gate.auto_approve_usd = 1e12;
+    cfg.dashboard.enabled              = false;
+    cfg.maker_timeout_ns               = 5'000'000ULL;
+
+    auto core = std::make_unique<ExecutionCore>(cfg);
+
+    StrategyOrderSignal sig{};
+    sig.instr_id   = 0;
+    sig.dir        = OrderDir::BUY;
+    sig.qty_lots   = 8;
+    sig.order_type = OrderType::MAKER;
+    core->on_strategy_order(sig);
+
+    // someone hits the resting bid before the timeout
+    ExecutionReport fill{};
+    fill.child_id         = 0;
+    fill.exec_type        = ExecType::FILL;
+    fill.exchange_id      = 0;
+    fill.fill_qty_lots    = 8;
+    fill.fill_price_ticks = 100;
+    fill.recv_ns           = 1;
+    core->on_execution_report(fill);
+
+    REQUIRE(core->positions().instruments[0].net_qty_lots.load() == 8);
+    REQUIRE(core->pool().parents_in_use()  == 0);  // fully filled, freed
+    REQUIRE(core->pool().children_in_use() == 0);
+
+    // ticking well past the maker timeout now must not do anything, there's
+    // nothing left in the timer wheel for this order, cancel() already ran
+    // when the fill came in
+    core->tick(real_now_ns() + cfg.maker_timeout_ns + 1'000'000ULL);
+    REQUIRE(core->pool().parents_in_use()  == 0);
+    REQUIRE(core->pool().children_in_use() == 0);
 }
