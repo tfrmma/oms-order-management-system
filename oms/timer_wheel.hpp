@@ -30,16 +30,30 @@ struct TimerEntry {
     bool        active{false};
 };
 
-// 1024 fine slots × 64 coarse slots = ~65 seconds of coverage at 1ms resolution.
-// slots are hashed by deadline, collisions are resolved by scanning the slot.
+// single flat ring, tick_ns_ resolution. NOT the two-level fine+coarse
+// hierarchy an earlier version of this comment claimed (~65s of coverage),
+// that was never actually built, this is what exists: kFineSlots slots at
+// tick_ns_ each, full stop.
+//
+// sized to comfortably exceed the largest timeout actually configured in
+// this codebase (ExecCoreConfig::maker_timeout_ns defaults to 5s) with
+// margin, not because 8192 is a nice number. undersizing this is a real
+// bug, not a theoretical one: a deadline further out than kFineSlots*tick_ns_
+// aliases onto an earlier slot's bucket index and can fire early, sometimes
+// almost immediately instead of after the real timeout. this was completely
+// invisible for the entire life of this repo because nothing ever called
+// ExecutionCore::run()/tick() with real wall-clock timestamps until the
+// hybrid maker-routing tests did, every earlier TimerWheel test drove it
+// with clean, tick_ns_-aligned numbers that couldn't expose either this or
+// the remainder bug documented on check_slot() below.
 //
 // slot depth used to be 8, "handles bursts without spilling". it didn't:
 // every child of one parent shares the same dispatch timestamp and the same
 // child_timeout_ns, so they all hash to the same slot, and a single order
 // can legitimately produce up to ParentOrder::kMaxChildrenPerParent (16)
 // children in one dispatch. depth 32 covers one maxed-out order with room
-// for a second one landing in the same 1ms tick, not just a guess this time.
-inline constexpr uint32_t kFineSlots   = 1024;
+// for a second one landing in the same 1ms tick.
+inline constexpr uint32_t kFineSlots  = 8192;   // 8192 * 1ms = 8.192s of unambiguous coverage
 inline constexpr uint32_t kSlotDepth  = 32;     // max concurrent timers per slot
 
 class TimerWheel {
@@ -112,12 +126,22 @@ private:
         for (uint32_t i = 0; i < kSlotDepth; ++i) {
             TimerEntry& e = wheel_[slot][i];
             if (!e.active) continue;
-            if (now_ns_ >= e.deadline_ns) {
-                g_log.warn("TIMER_WHEEL  TIMEOUT  child_id=%u  deadline_ns=%lu  now_ns=%lu",
-                           e.child_id, (unsigned long)e.deadline_ns, (unsigned long)now_ns_);
-                e.active = false;
-                if (callback_) callback_(e.child_id);
-            }
+            // NOT "now_ns_ >= e.deadline_ns". now_ns_ advances in tick_ns_
+            // steps from whatever reset_clock() was last given, so its exact
+            // value at a given bucket carries THAT timestamp's sub-tick
+            // remainder, not the deadline's. two real timestamps (insert's
+            // now_ns and reset_clock's) essentially never share a remainder,
+            // so a strict >= here can spuriously come back false on the
+            // correct visit and then not fire until the entry's slot comes
+            // back around a full kFineSlots*tick_ns_ later. reaching this
+            // slot at all, via monotonic single-tick-at-a-time stepping,
+            // already means we're within tick_ns_ of the real deadline,
+            // which is exactly this wheel's resolution, firing here is
+            // correct to that resolution by construction.
+            g_log.warn("TIMER_WHEEL  TIMEOUT  child_id=%u  deadline_ns=%lu  now_ns=%lu",
+                       e.child_id, (unsigned long)e.deadline_ns, (unsigned long)now_ns_);
+            e.active = false;
+            if (callback_) callback_(e.child_id);
         }
     }
 
