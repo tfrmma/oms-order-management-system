@@ -62,16 +62,25 @@ enum class ExecType : uint8_t {
 };
 
 // strategy speaks USD. OMS converts to ticks internally.
+//
+// order_type: TAKER (default) crosses immediately via the SOR, same as
+// before this field existed. MAKER posts passively at the touch and, if
+// unfilled after ExecCoreConfig::maker_timeout_ns, gets canceled and swept
+// as a taker for whatever's left, see ExecutionCore::dispatch_child_orders
+// and reroute_leaves. explicit default here on purpose: sor::OrderType::MAKER
+// is enum value 0, a bare StrategyOrderSignal{} would silently default to
+// MAKER without this, breaking every existing caller that doesn't set it.
 struct alignas(kCacheLine) StrategyOrderSignal {
-    double        limit_price_usd;  // 0.0 = no limit
-    qty_t         qty_lots;         // canonical unit: InstrumentTable::lot_size(instr_id)
-    instr_id_t    instr_id;
-    sor::OrderDir dir;
-    uint8_t       strategy_id;
-    uint8_t       _pad[5];
-    uint64_t      signal_ns;
-    double        short_vol_factor;
-    double        book_imbalance;
+    double         limit_price_usd;  // 0.0 = no limit
+    qty_t          qty_lots;         // canonical unit: InstrumentTable::lot_size(instr_id)
+    instr_id_t     instr_id;
+    sor::OrderDir  dir;
+    uint8_t        strategy_id;
+    sor::OrderType order_type{sor::OrderType::TAKER};
+    uint8_t        _pad[4];
+    uint64_t       signal_ns;
+    double         short_vol_factor;
+    double         book_imbalance;
 };
 
 struct alignas(kCacheLine) ExecutionReport {
