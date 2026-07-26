@@ -33,6 +33,22 @@ public:
         ChildOrderBuffer&     out
     ) noexcept;
 
+    // posts one passive order at the touch on whichever active exchange
+    // gives the best maker-fee-adjusted price, instead of walking the book
+    // like calculate_optimal_split does. BUY posts on the BID side, SELL on
+    // the ASK side, the opposite of which side calculate_optimal_split reads,
+    // a maker order adds liquidity to your own side, it doesn't cross into
+    // the other one. out.count is 0 or 1: this never splits across venues,
+    // posting the same size on multiple books at once risks a double fill
+    // with no coordination between them, out of scope for v1. Result carries
+    // no fill yet, filled_qty is always 0 here, it's a placement decision,
+    // not a fill, the caller's downstream execution-report handling is what
+    // eventually fills it.
+    SplitResult calculate_maker_placement(
+        const RoutingContext& ctx,
+        ChildOrderBuffer&     out
+    ) noexcept;
+
     // ctx.reference_lot_size, or states[0]'s native lot_size if unset. public
     // because ExecutionCore needs the exact same resolution when it converts
     // a real-world qty gap (e.g. an undispatched child) back into the
