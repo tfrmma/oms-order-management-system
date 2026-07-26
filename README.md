@@ -21,16 +21,18 @@ doubles only show up to report it.
 flowchart TB
     SIG["StrategyOrderSignal<br/>(strategy thread)"]
 
-    subgraph EXEC["ExecutionCore::run(), single thread, busy-spin"]
+    subgraph EXEC["ExecutionCore::tick(), called every run() iteration"]
         direction TB
         GATE["NotionalConfirmationGate<br/>auto-approve / block / confirm"]
         RISK["PreTradeRiskEngine<br/>fat-finger · position · notional · margin"]
         POOL["OMSOrderPool<br/>alloc ParentOrder"]
-        SOR["sor::RoutingEngine<br/>calculate_optimal_split"]
-        DISP["dispatch_child_orders<br/>+ TimerWheel.insert (cancel-on-timeout)"]
+        SOR["sor::RoutingEngine<br/>TAKER: calculate_optimal_split<br/>MAKER: calculate_maker_placement"]
+        DISP["dispatch_child_orders"]
+        TW["TimerWheel<br/>child_timeout_ns (taker) / maker_timeout_ns (maker)"]
         REP["on_execution_report"]
         FILL["handle_fill / handle_cancel_reject"]
-        RRT["reroute_leaves<br/>(leaves_qty > 0, all children terminal)"]
+        RRT["reroute_leaves, always TAKER<br/>(leaves_qty > 0, all children terminal)"]
+        REJQ["reject_queue<br/>OrderReject + RejectReason"]
     end
 
     subgraph GW["Gateway threads, one per exchange"]
@@ -49,18 +51,31 @@ flowchart TB
     SIG -->|"InboundQueue&lt;StrategyOrderSignal&gt;"| GATE --> RISK --> POOL --> SOR --> DISP
     DISP -->|"GatewayQueue&lt;OutboundOrder&gt;, per exchange"| G0
     DISP -->|"GatewayQueue&lt;OutboundOrder&gt;, per exchange"| G1
+    DISP --> TW
+    TW -.->|"unfilled by deadline: synthesized CANCELED report"| REP
     G0 -->|"InboundQueue&lt;ExecutionReport&gt;"| REP
     G1 -->|"InboundQueue&lt;ExecutionReport&gt;"| REP
     REP --> FILL --> RRT --> SOR
+
+    GATE -.->|blocked/rejected| REJQ
+    RISK -.->|rejected| REJQ
+    POOL -.->|exhausted| REJQ
+    SOR -.->|no liquidity| REJQ
+    REJQ -->|"OutboundQueue&lt;OrderReject&gt;"| SIG
 
     FEED -.->|atomics, no lock| SOR
     REST -.->|atomics, no lock| RISK
 ```
 
-Everything inside the `ExecutionCore` box runs on one thread. Nothing in that
-box blocks except the notional gate's stdin prompt, and that's intentional,
-see [Design decisions](#design-decisions). Everything outside it talks to the
-execution thread through SPSC queues or plain atomics, never a mutex.
+`tick()` is one iteration of what used to be inlined into `run()`'s loop: drain
+both inbound queues, advance the timer wheel, check margin warnings. `run()`
+is just `while(running_) tick(now_ns());` now, `tick()` is public so a test
+(or any caller that wants its own scheduling) can drive time forward
+deterministically instead of actually sleeping past a timeout to prove
+something fires. Nothing in the `EXEC` box blocks except the notional gate's
+stdin prompt, and that's intentional, see [Design decisions](#design-decisions).
+Everything outside it talks to the execution thread through SPSC queues or
+plain atomics, never a mutex.
 
 ---
 
@@ -167,6 +182,54 @@ to the first active exchange's native lot size, which is exactly the old
 relying on that fallback, direct `sor::RoutingEngine` callers (like
 `main_example.cpp`) still get the fallback for free.
 
+**Maker is post-then-sweep, not a parallel strategy.** `StrategyOrderSignal::order_type
+= MAKER` posts one passive order at the touch (`calculate_maker_placement`,
+BID side for BUY, ASK side for SELL, the mirror of which side the taker path
+reads) and starts a `maker_timeout_ns` clock instead of `child_timeout_ns`.
+Nothing else about the pipeline changes: the same `dispatch_child_orders`,
+the same `TimerWheel`, the same `on_execution_report`/`handle_fill` path a
+taker child already used. If the maker order fills before the timeout,
+done. If it doesn't, the timeout fires the exact same cancel-on-timeout
+callback a taker child's timeout would, which routes into
+`handle_cancel_reject` and, since `reroute_leaves` always calls the TAKER
+SOR regardless of how a parent got here, the unfilled remainder gets swept
+as taker automatically. No new state machine, no code path that needs to
+know "was this originally a maker order", `reroute_leaves` needed zero
+changes to do the sweep correctly. `calculate_maker_placement` never splits
+across venues on purpose: posting the same size on multiple books at once
+risks a double fill with no coordination between them, out of scope for v1.
+
+**The timer wheel's clock has to be primed before its first real tick, or
+it doesn't come back.** `TimerWheel::now_ns_` defaults to 0. `tick(now)`
+catches up to `now` by walking forward `tick_ns_` (1ms) at a time, which is
+fine if `now` is close to `now_ns_` already, and catastrophic if it isn't:
+the first-ever call in a real deployment would have to walk from 0 up to the
+real epoch, roughly 1.7e12 steps. `ExecutionCore`'s constructor now calls
+`timer_wheel_.reset_clock(now_ns())` to fix that, `reset_clock()` already
+existed for exactly this, nothing was calling it. This was completely
+invisible for this repo's entire history because nothing, including
+`oms_example.cpp`, ever actually called `run()`/`tick()`, every verification
+in this README up to this point only ever exercised `on_strategy_order`/
+`on_execution_report` directly. Building a hybrid-maker test that genuinely
+needed to advance time past a timeout is what first called `tick()` for
+real and caught it. A second, independent bug came with it: `check_slot`
+used to require `now_ns_ >= entry.deadline_ns` exactly, but `now_ns_` and a
+given deadline come from two different real timestamps with unrelated
+sub-tick remainders, so that comparison could spuriously come back false on
+the correct pass and then not fire until the wheel's next full lap. Fixed by
+firing on reaching the deadline's bucket at all, not on an exact value
+comparison, correct to the wheel's own `tick_ns_` resolution by
+construction. Also raised `kFineSlots` from 1024 to 8192: at 1024, the
+wheel's ~1.024s of total coverage was already smaller than the *existing*
+`child_timeout_ns` default (2s), so any timeout longer than that range
+aliased onto an earlier slot and could fire early. `ExecutionCore` grew from
+~2.8 MB to ~9.1 MB as a result, still "heap-allocate it" advice, just a
+bigger number, see [Using it](#using-it). None of this was reachable from
+any test in this repo until this session, standalone `TimerWheel` tests all
+happened to use clean, `tick_ns_`-aligned numbers that couldn't expose
+either bug, and nothing ever drove `ExecutionCore`'s wheel with real
+timestamps.
+
 ---
 
 ## Repository layout
@@ -208,7 +271,7 @@ oms-order-management-system/
 
 | Component | Owns | Explicitly does not |
 |---|---|---|
-| `sor::RoutingEngine` | Splitting one target size across N exchange books at one point in time | Remember anything about a previous call, know what an "order" is beyond a size and a direction |
+| `sor::RoutingEngine` | Splitting a target size across N exchange books (TAKER), or picking the single best venue to post passively on (MAKER) | Remember anything about a previous call, know what an "order" is beyond a size and a direction, split a MAKER placement across venues |
 | `oms::InstrumentTable` | The one `lot_size` every other component reads | Tick size, symbols, anything beyond what's needed today |
 | `oms::PreTradeRiskEngine` | Fat-finger, position limit, notional, margin checks, ~100ns budget | Know about exchanges, books, or the SOR at all |
 | `oms::NotionalConfirmationGate` | The one deliberately blocking call in the pipeline | Run on the execution thread's hot path for small orders (auto-approves below threshold) |
@@ -243,6 +306,21 @@ Depth is bounded at `kMaxDepth` (20) levels per exchange side,
 `kMaxChildOrders = kMaxExchanges × kMaxDepth = 100` child orders is the hard
 ceiling for one split.
 
+`RoutingEngine::calculate_maker_placement` is a different, much shorter
+algorithm for `order_type = MAKER`: no merge, no greedy fill, because it
+isn't consuming book depth, it's posting one order at the touch. For each
+active exchange, read the touch on your own side (BID for BUY, ASK for
+SELL, the opposite of which side `calculate_optimal_split` reads for the
+same direction), adjust it by that exchange's maker fee (`FeeMatrix::maker`,
+which can be negative, a rebate makes a given price more attractive without
+any special-casing), and keep the best one. `out.count` is 0 or 1, this
+never splits a maker order across venues, posting the same size on multiple
+books at once risks a double fill with no coordination between the two.
+`SplitResult::filled_qty` is always 0 here (a placement isn't a fill),
+`spread_capture_bps` reports the distance from the posted price to the
+book's opposite touch, how much spread this placement is positioned to
+capture if it fills as posted.
+
 ---
 
 ## How the OMS works
@@ -259,17 +337,23 @@ ceiling for one split.
 3. `PreTradeRiskEngine::validate`, fat-finger, then position limit, then margin
    (which itself can reject for `NOTIONAL` or `MARGIN`, propagated as the real
    reason, not collapsed into one). Each maps to its own `RejectReason`.
-4. `build_routing_context` + `sor_.calculate_optimal_split`, the SOR runs
-   exactly once per signal here, with no memory of anything before it. Zero
-   liquidity pushes `RejectReason::NO_LIQUIDITY`.
+4. `build_routing_context` + the SOR, `calculate_optimal_split` for TAKER
+   (the default) or `calculate_maker_placement` for `order_type = MAKER`,
+   picked in `on_strategy_order` by a single ternary, everything else in
+   this list is identical either way. The SOR runs exactly once per signal
+   here, with no memory of anything before it. Zero liquidity pushes
+   `RejectReason::NO_LIQUIDITY`.
 5. `dispatch_child_orders`, one `alloc_child()` + `timer_wheel_.insert()`
-   per child, pushed onto that exchange's `GatewayQueue<OutboundOrder>`. If
-   fewer children make it out than the SOR intended, whether from the child
-   pool running out or hitting `ParentOrder::kMaxChildrenPerParent`, the
-   undispatched remainder's margin reservation is released immediately
-   (`DISPATCH_GAP`, see `to_canonical_lots`), and if literally nothing made
-   it out, `RejectReason::CHILD_POOL_EXHAUSTED` is pushed and the parent is
-   freed instead of parked forever.
+   per child, pushed onto that exchange's `GatewayQueue<OutboundOrder>`. A
+   maker child gets `maker_timeout_ns` on the clock instead of
+   `child_timeout_ns`, picked per-child off `co.type`, same `TimerWheel`,
+   same callback either way. If fewer children make it out than the SOR
+   intended, whether from the child pool running out or hitting
+   `ParentOrder::kMaxChildrenPerParent`, the undispatched remainder's margin
+   reservation is released immediately (`DISPATCH_GAP`, see
+   `to_canonical_lots`), and if literally nothing made it out,
+   `RejectReason::CHILD_POOL_EXHAUSTED` is pushed and the parent is freed
+   instead of parked forever.
 6. Fills and cancels arrive on `exec_report_queue`, `on_execution_report`
    routes to `handle_fill` or `handle_cancel_reject`. Both convert the
    report's `fill_qty_lots` (native to whichever exchange it came from) into
@@ -279,14 +363,21 @@ ceiling for one split.
 7. If a parent still has `leaves_qty_lots > 0` once all its current children
    are terminal, whether they got there via a fill or a cancel,
    `reroute_leaves` rebuilds the `RoutingContext` from the current book state
-   and calls the SOR again for the remainder. Still no liquidity here either
-   pushes `RejectReason::NO_LIQUIDITY` for the gap and frees the parent.
+   and calls `calculate_optimal_split`, TAKER, always, regardless of what
+   the parent's original `order_type` was. This is the entire mechanism
+   behind "post as maker, sweep the rest as taker": a timed-out maker child
+   reaches this step exactly the same way a canceled taker child would, and
+   `reroute_leaves` doesn't need to know or care which one happened. Still
+   no liquidity here either pushes `RejectReason::NO_LIQUIDITY` for the gap
+   and frees the parent.
 
 The timer wheel fires independently of all of this: if a child sits in
-`PENDING_NEW`/`PARTIALLY_FILLED` past `child_timeout_ns`, the wheel's callback
+`PENDING_NEW`/`PARTIALLY_FILLED` past its deadline, `child_timeout_ns` for a
+TAKER child or `maker_timeout_ns` for a MAKER one, the wheel's callback
 synthesizes a `CANCELED` execution report and routes it through the exact
-same `on_execution_report` path a real exchange cancel would take, no special
-casing for timeouts anywhere downstream of that.
+same `on_execution_report` path a real exchange cancel would take, no
+special casing for timeouts, or for maker vs. taker, anywhere downstream of
+that.
 
 ---
 
@@ -294,7 +385,7 @@ casing for timeouts anywhere downstream of that.
 
 | Thread | Reads | Writes | Sync |
 |---|---|---|---|
-| Execution (`ExecutionCore::run`) | `strategy_queue`, `exec_report_queue`, all `ExchangeState`, `BookSnapshotCache` | `pool_`, `pos_`, `routing_ctx_`, `timer_wheel_` | SPSC pop, relaxed/acquire loads on shared atomics |
+| Execution (`ExecutionCore::run`, one `tick()` per iteration) | `strategy_queue`, `exec_report_queue`, all `ExchangeState`, `BookSnapshotCache` | `pool_`, `pos_`, `routing_ctx_`, `timer_wheel_` | SPSC pop, relaxed/acquire loads on shared atomics |
 | Feed handler(s) | market data | `ExchangeState.latency`, `.book`, `BookSnapshotCache` | atomic stores, release |
 | Gateway (per exchange) | `GatewayQueue<OutboundOrder>` | exchange socket, `exec_report_queue` | SPSC pop/push |
 | REST reconciliation | exchange REST API | `MarginMonitor` (`on_rest_update`) | atomic stores |
@@ -329,9 +420,16 @@ plus a separate ASan/UBSan job on every push and PR to `main`.
 ASan + UBSan build:
 ```bash
 cmake .. -DCMAKE_BUILD_TYPE=Debug
-make oms_example_san -j$(nproc)
+make oms_example_san oms_tests_san -j$(nproc)
 ./oms_example_san
+./oms_tests_san
 ```
+
+`oms_tests_san` exists because `oms_example_san` alone didn't catch a real
+stack-overflow-turned-SIGSEGV bug (`ExecutionCore` grew past what a default
+thread stack tolerates, see [Design decisions](#design-decisions)), the test
+binary constructs many `ExecutionCore` instances and is a better sanitizer
+target for exactly that class of bug than the demo is.
 
 ## Testing
 
@@ -341,15 +439,26 @@ make oms_tests -j$(nproc)
 ./oms_tests
 ```
 
-Covers the SOR merge/fill algorithm (single and multi-exchange, partial
-fills, limit price clipping, BUY/SELL sign handling, mismatched lot sizes
-across exchanges), `OMSOrderPool` alloc/free and failure counting,
-`InstrumentPosition` avg price tracking, `PreTradeRiskEngine` rejection
-paths, `SpscQueue`, `TimerWheel`, and four `ExecutionCore` integration tests
-that drive a real pool through `on_strategy_order` (the public API, not a
+28 test cases, ~4260 assertions. Covers the SOR merge/fill algorithm (single
+and multi-exchange, partial fills, limit price clipping, BUY/SELL sign
+handling, mismatched lot sizes across exchanges), `calculate_maker_placement`
+(bid/ask side selection, fee-adjusted venue ranking, limit price, no-touch
+failure, `spread_capture_bps`), `OMSOrderPool` alloc/free and failure
+counting, `InstrumentPosition` avg price tracking, `PreTradeRiskEngine`
+rejection paths, `SpscQueue`, `TimerWheel`, and several `ExecutionCore`
+integration tests that drive a real, heap-allocated `ExecutionCore` through
+its public API (`on_strategy_order`/`on_execution_report`/`tick`, not a
 mock): the dispatch-gap margin/reroute fix, cross-exchange fill accounting
-through `InstrumentTable`, and `reject_queue` delivering the right
-`RejectReason` for risk, liquidity, and notional-gate rejections.
+through `InstrumentTable`, `reject_queue` delivering the right `RejectReason`,
+and the full maker-then-taker-sweep hybrid end to end, `tick()` driven with
+real `CLOCK_REALTIME`-scale timestamps rather than small fixed numbers,
+`ExecutionCore`'s internal `now_ns()` is real wall-clock time and the timer
+wheel only behaves correctly relative to that same clock.
+
+Every `ExecutionCore` in the test suite is heap-allocated
+(`std::make_unique`), never a stack local, `sizeof(ExecutionCore)` is large
+enough now (~9.1 MB) that a stack instance is a real overflow risk, not a
+style preference, see [Using it](#using-it).
 
 Built with `-fno-exceptions` like the rest of the project. Catch2
 auto-detects this and switches `REQUIRE` to abort the whole binary on
@@ -378,13 +487,14 @@ cfg.risk_limits.max_order_lots[BTC_PERP]      = to_lots(10.0, 0.001);
 cfg.risk_limits.max_net_lots[BTC_PERP]        = to_lots(50.0, 0.001);
 cfg.risk_limits.max_notional_usd              = 500'000.0;
 cfg.instruments.instruments[BTC_PERP].lot_size = 0.001;  // read by risk, gate, and routing
+cfg.maker_timeout_ns                          = 5'000'000'000ULL;  // 5s, MAKER-only
 
-// ~2.8 MB, don't put it on the stack
+// ~9.1 MB (TimerWheel alone is ~6 MB), heap-allocate, never a stack local
 auto core = std::make_unique<ExecutionCore>(cfg);
 
 std::thread exec_thread([&]{ core->run(); });
 
-// strategy pushes signals
+// TAKER (default): crosses immediately via the SOR
 StrategyOrderSignal sig{};
 sig.instr_id         = BTC_PERP;
 sig.dir              = OrderDir::BUY;
@@ -393,6 +503,12 @@ sig.limit_price_usd  = 65115.0;
 sig.short_vol_factor = 0.3;
 sig.book_imbalance   = 0.15;
 core->strategy_queue.push(sig);
+
+// MAKER: posts passively at the touch, sweeps any unfilled remainder as
+// taker after maker_timeout_ns, everything else about the signal is the same
+StrategyOrderSignal maker_sig = sig;
+maker_sig.order_type = OrderType::MAKER;
+core->strategy_queue.push(maker_sig);
 
 // gateway threads push fills. fill_qty_lots is in THIS exchange's native
 // lot size, ExecutionCore converts it internally, don't pre-convert it.
@@ -430,6 +546,12 @@ At `vol=1, imbalance=1` that's a 7.5× multiplier. A venue at 820 µs during a C
 Fill rate estimate: `exp(-2e-4 × RTT) × (1 - 0.10×vol) × (1 - 0.08×imbalance)`, floored at 50%.
 
 Constants were calibrated against internal fill data. Recalibrate for your exchanges if you have better data.
+
+`calculate_maker_placement` uses a simpler version of the same shape:
+`effective_price = raw_price ± maker_fee`, no latency term, a resting order
+isn't racing anyone for the fill the way a taker sweep is. `FeeMatrix::maker`
+can be negative, a rebate pulls `effective_price` further in your favor
+without any special-casing in the comparison.
 
 ---
 
@@ -471,7 +593,30 @@ Constants were calibrated against internal fill data. Recalibrate for your excha
   "handles bursts" claim, which it didn't. Only surfaced because every
   earlier verification run in this README's own history redirected
   `oms_example`'s stderr to `/dev/null` and only checked the exit code.
-- No maker routing. 100% taker.
+- **Fixed, and considerably more serious:** `TimerWheel::now_ns_` defaults to
+  0. Nothing called `reset_clock()` to prime it before the first real
+  `tick()`, so in any real deployment, the very first call would try to walk
+  from 0 up to the real epoch one `tick_ns_` (1ms) at a time, roughly 1.7e12
+  iterations, effectively a permanent hang the moment `run()` was ever
+  actually called. A second, independent bug rode along: `check_slot`
+  required `now_ns_ >= entry.deadline_ns` exactly, but two real timestamps
+  essentially never share a sub-tick remainder, so that check could
+  spuriously fail on the correct pass and not fire until a full lap later
+  (~1s off at the old `kFineSlots`). And `kFineSlots` itself, at 1024, gave
+  only ~1.024s of unambiguous coverage, smaller than `child_timeout_ns`'s
+  own 2s default, so timeouts longer than that range could alias onto an
+  earlier slot and fire early instead. All three fixed together: constructor
+  primes the clock, `check_slot` fires on reaching the deadline's bucket
+  instead of an exact comparison, `kFineSlots` raised to 8192. None of this
+  was reachable from any test or example in this repo's history, nothing
+  ever called `run()`/`tick()` with real timestamps until the hybrid
+  maker-routing tests needed to. `ExecutionCore` is ~9.1 MB now (`TimerWheel`
+  alone is ~6 MB), still "heap-allocate it", just a bigger number, see
+  [Using it](#using-it). Building `oms_tests_san` to check this surfaced yet
+  another bug: several tests stack-allocated `ExecutionCore` directly, which
+  had been marginal even before this and became an outright stack overflow
+  (SIGSEGV) after. Fixed by heap-allocating every `ExecutionCore` in the
+  suite, matching what the README's own usage example already said to do.
 - **Fixed:** `oms_example_san` and `oms_tests` both used to hardcode their
   own copy of `sor/routing_engine.cpp` + `oms/execution_core.cpp` instead of
   linking `sor_lib`/`oms_lib`, because they genuinely need different compile
