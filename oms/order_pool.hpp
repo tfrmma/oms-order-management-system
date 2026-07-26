@@ -33,6 +33,13 @@ struct alignas(kCacheLine) ParentOrder {
     uint8_t     strategy_id;
     uint8_t     child_count;
 
+    // how this parent's FIRST dispatch was routed. always set explicitly in
+    // on_strategy_order right after reset(), reset()'s memset would otherwise
+    // zero this to OrderType::MAKER regardless of what the signal asked for.
+    // a maker parent whose timer sweeps the remainder as taker keeps this
+    // value, it's "how you started", not "how you're currently routing".
+    sor::OrderType order_type;
+
     qty_t       total_qty_lots;
     qty_t       cum_qty_lots;
     qty_t       leaves_qty_lots;
@@ -48,7 +55,7 @@ struct alignas(kCacheLine) ParentOrder {
     static constexpr uint8_t kMaxChildrenPerParent = 16;
     child_id_t  children[kMaxChildrenPerParent];
     uint16_t    child_mask;
-    uint8_t     _pad[6];
+    uint8_t     _pad[5];
 
     void reset() noexcept {
         std::memset(this, 0, sizeof(*this));
