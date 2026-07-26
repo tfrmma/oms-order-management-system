@@ -99,3 +99,34 @@ target_compile_options(oms_tests PRIVATE
     -Wall -Wextra -Wno-unused-parameter
 )
 target_link_libraries(oms_tests PRIVATE catch2_lib Threads::Threads)
+
+# same reasoning as oms_example_san: recompiles instead of linking catch2_lib/
+# sor_lib/oms_lib, sanitizers need everything built with the flag, mixing in
+# an uninstrumented library defeats the point. found a real stack-overflow-
+# turned-SIGSEGV bug the very first time this target existed (ExecutionCore
+# grew past what a default thread stack tolerates once TimerWheel's kFineSlots
+# went from 1024 to 8192), it earns its place in CI.
+add_executable(oms_tests_san
+    tests/test_oms.cpp
+    tests/catch_amalgamated.cpp
+    ${SOR_SOURCES}
+    ${OMS_SOURCES}
+)
+target_include_directories(oms_tests_san PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/oms
+    tests/
+)
+target_compile_options(oms_tests_san PRIVATE
+    -O1 -g -fsanitize=address,undefined
+    -fno-omit-frame-pointer -fno-exceptions -fno-rtti
+    -Wall -Wextra -Wno-unused-parameter
+    # false positive, confirmed: GCC's -Wmaybe-uninitialized misfires inside
+    # libstdc++'s <regex> internals (regex_automaton.h's std::function move
+    # ctor, inlined into Catch2's test-name/tag matcher) specifically under
+    # -fsanitize=..., the same libstdc++ headers compile warning-free without
+    # the sanitizer flags on oms_tests. not our code, not a real bug.
+    -Wno-maybe-uninitialized
+)
+target_link_options(oms_tests_san PRIVATE -fsanitize=address,undefined)
+target_link_libraries(oms_tests_san PRIVATE Threads::Threads)
