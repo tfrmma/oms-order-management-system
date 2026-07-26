@@ -29,7 +29,8 @@ struct ExecCoreConfig {
     NotionalGateConfig   notional_gate{};
     DashboardConfig      dashboard{};
     MarginConfig         margin{};
-    uint64_t             child_timeout_ns{2'000'000'000ULL};  // 2s default
+    uint64_t             child_timeout_ns{2'000'000'000ULL};  // 2s default, taker child ack/fill timeout
+    uint64_t             maker_timeout_ns{5'000'000'000ULL};  // 5s default, how long a posted order waits before the unfilled remainder gets swept as taker
     sor::ExchangeState*  exchange_states{nullptr};
     uint32_t             active_exchanges{0};
     GatewayHandle        gateways[sor::kMaxExchanges]{};
@@ -42,6 +43,13 @@ public:
     // single-threaded busy-spin loop. call from the execution thread.
     void run() noexcept;
     void stop() noexcept { running_ = false; }
+
+    // one iteration of what run()'s loop does: drain both inbound queues,
+    // advance the timer wheel, check margin warnings. public so tests (and
+    // any caller that wants its own scheduling instead of a dedicated
+    // busy-spin thread) can drive time forward deterministically without
+    // actually sleeping past child_timeout_ns/maker_timeout_ns.
+    void tick(uint64_t now) noexcept;
 
     void on_strategy_order(const StrategyOrderSignal& sig)  noexcept;
     void on_execution_report(const ExecutionReport& report) noexcept;
