@@ -106,11 +106,40 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
     parent.instr_id         = sig.instr_id;
     parent.dir               = sig.dir;
     parent.order_type        = sig.order_type;
-    parent.total_qty_lots   = sig.qty_lots;
-    parent.leaves_qty_lots  = sig.qty_lots;
     parent.strategy_id      = sig.strategy_id;
     parent.create_ns        = sig.signal_ns ? sig.signal_ns : now_ns();
     parent.state            = OrderState::NEW;
+
+    // reduce-only clamp, before anything else touches qty_lots: fat-finger
+    // and notional checks below need to see the EFFECTIVE size, not the
+    // originally-requested one, or a legitimately-clamped-down order could
+    // fail a limit check it would have passed at its real size.
+    //
+    // instr_id bounds guarded here directly: risk_.validate()'s own DISABLED
+    // check runs AFTER this block, pos_.instruments[] can't wait for it.
+    const bool instr_ok = sig.instr_id < kMaxInstruments;
+    const qty_t effective_qty = risk_.clamp_reduce_only(sig);
+    parent.reduce_only = instr_ok && (sig.reduce_only ||
+        pos_.instruments[sig.instr_id].unwind_only.load(std::memory_order_acquire));
+
+    if (instr_ok && effective_qty == 0) [[unlikely]] {
+        g_log.error("REDUCE_ONLY_VIOLATION  parent_id=%u  instr=%u  dir=%s  requested=%ld  net=%ld",
+            id_res.value, (unsigned)sig.instr_id,
+            (sig.dir == sor::OrderDir::BUY) ? "BUY" : "SELL",
+            (long)sig.qty_lots,
+            (long)pos_.instruments[sig.instr_id].net_qty_lots.load(std::memory_order_acquire));
+        parent.state = OrderState::REJECTED;
+        pool_.free_parent(id_res.value);
+        notify_reject(sig, RejectReason::REDUCE_ONLY_VIOLATION);
+        return;
+    }
+    if (instr_ok && effective_qty != sig.qty_lots) [[unlikely]] {
+        g_log.warn("REDUCE_ONLY_CLAMPED  parent_id=%u  instr=%u  requested=%ld  clamped_to=%ld",
+            id_res.value, (unsigned)sig.instr_id, (long)sig.qty_lots, (long)effective_qty);
+    }
+
+    parent.total_qty_lots  = effective_qty;
+    parent.leaves_qty_lots = effective_qty;
 
     // all exchanges share the same tick size in this universe. if that changes,
     // this needs to be per-instrument. not today's problem.
@@ -119,10 +148,16 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
         ? sor::to_ticks(sig.limit_price_usd, tick_sz)
         : price_t(0);
 
-    const RiskRejectReason risk_result = risk_.validate(sig);
+    // risk checks (fat-finger, position, notional, margin) run against the
+    // EFFECTIVE size, a signal with the requested (pre-clamp) qty_lots would
+    // check the wrong number.
+    StrategyOrderSignal eff_sig = sig;
+    eff_sig.qty_lots = effective_qty;
+
+    const RiskRejectReason risk_result = risk_.validate(eff_sig);
     if (risk_result != RiskRejectReason::OK) [[unlikely]] {
         g_log.error("RISK_REJECT  parent_id=%u  instr=%u  qty=%ld  limit_usd=%.2f  reason=%u",
-            id_res.value, (unsigned)sig.instr_id, (long)sig.qty_lots, sig.limit_price_usd,
+            id_res.value, (unsigned)sig.instr_id, (long)effective_qty, sig.limit_price_usd,
             (unsigned)risk_result);
         parent.state = OrderState::REJECTED;
         pool_.free_parent(id_res.value);
@@ -140,7 +175,7 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
         return;
     }
 
-    build_routing_context(parent, sig.qty_lots, routing_ctx_);
+    build_routing_context(parent, effective_qty, routing_ctx_);
     routing_ctx_.short_vol_factor = sig.short_vol_factor;
     routing_ctx_.book_imbalance   = sig.book_imbalance;
     routing_ctx_.decision_ns      = now_ns();
@@ -167,7 +202,7 @@ void ExecutionCore::on_strategy_order(const StrategyOrderSignal& sig) noexcept {
     }
 
     parent.state = OrderState::PENDING_NEW;
-    pos_.instruments[sig.instr_id].reserve_open(sig.dir, sig.qty_lots);
+    pos_.instruments[sig.instr_id].reserve_open(sig.dir, effective_qty);
     dispatch_child_orders(parent, child_buf_, routing_ctx_);
     (void)split;
 }
@@ -453,6 +488,44 @@ void ExecutionCore::reroute_leaves(ParentOrder& parent) noexcept {
     }
     parent.child_count = 0;
     parent.child_mask  = 0;
+
+    // the position may have moved since the ORIGINAL clamp if another parent
+    // on this same instrument filled in between, always re-check against the
+    // CURRENT position rather than trusting that leaves_qty_lots is still
+    // safe to route in full. this is the entire reason reduce_only lives on
+    // the parent, not just the original signal. deliberately placed after
+    // the cleanup loop above: every child here is already terminal (that's
+    // reroute_leaves's precondition) and needs to be freed either way, an
+    // early return before that loop ran would leak them.
+    if (parent.reduce_only) {
+        const qty_t safe_qty = risk_.clamp_reduce_only(
+            parent.instr_id, parent.dir, parent.leaves_qty_lots, /*reduce_only_requested=*/true);
+
+        if (safe_qty < parent.leaves_qty_lots) {
+            const qty_t excess = parent.leaves_qty_lots - safe_qty;
+            pos_.instruments[parent.instr_id].release_open(parent.dir, excess);
+            g_log.warn("REROUTE_REDUCE_ONLY_SHRUNK  parent_id=%u  was_leaves=%ld  now_leaves=%ld  excess_released=%ld",
+                parent.parent_id, (long)parent.leaves_qty_lots, (long)safe_qty, (long)excess);
+            parent.total_qty_lots  -= excess;
+            parent.leaves_qty_lots  = safe_qty;
+        }
+
+        if (parent.leaves_qty_lots == 0) [[unlikely]] {
+            // position closed out from under this order entirely, nothing
+            // left that's still safe to reduce, this isn't NO_LIQUIDITY, it's
+            // "the job is already done or no longer applicable"
+            g_log.warn("REROUTE_REDUCE_ONLY_DONE  parent_id=%u  cum_qty_lots=%ld",
+                parent.parent_id, (long)parent.cum_qty_lots);
+            parent.state = (parent.cum_qty_lots > 0) ? OrderState::FILLED
+                                                      : OrderState::REJECTED;
+            pool_.free_parent(parent.parent_id);
+            return;
+        }
+
+        // leaves_qty_lots may have shrunk, keep the SOR's routing context in
+        // sync instead of routing against the pre-shrink target.
+        routing_ctx_.target_lots = parent.leaves_qty_lots;
+    }
 
     child_buf_.reset();
     sor_.calculate_optimal_split(routing_ctx_, child_buf_);
