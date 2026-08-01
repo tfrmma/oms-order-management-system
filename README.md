@@ -230,6 +230,27 @@ happened to use clean, `tick_ns_`-aligned numbers that couldn't expose
 either bug, and nothing ever drove `ExecutionCore`'s wheel with real
 timestamps.
 
+**Reduce-only clamps, it doesn't just reject.** `StrategyOrderSignal::reduce_only`
+(or `InstrumentPosition::unwind_only`, an ops-controlled per-instrument kill
+switch that overrides whatever the signal says) never lets an order grow or
+flip a position. Wrong direction or already flat gets rejected outright
+(`RejectReason::REDUCE_ONLY_VIOLATION`), same-direction oversized gets
+silently clamped down to exactly what closes the position instead. The
+clamp (`PreTradeRiskEngine::clamp_reduce_only`) checks `open_buy_lots`/
+`open_sell_lots`, not just `net_qty_lots`: two reduce-only orders on the same
+instrument, submitted before either fills, would otherwise both clamp
+against the same confirmed position independently and could together
+overshoot flat and flip it, exactly what reduce-only exists to prevent.
+`reroute_leaves` re-runs the same clamp against the CURRENT position before
+sweeping a parent's leftover `leaves_qty_lots`, a stale cap from the
+original signal isn't good enough once other orders on the same instrument
+have filled in the meantime, `ParentOrder::reduce_only` carries the
+constraint for the parent's whole lifecycle so this can't be skipped on a
+reroute. The kill switch is deliberately not just "the strategy is supposed
+to set the flag": a strategy bug that forgets it during an active unwind
+still gets stopped by `PreTradeRiskEngine`, the point of failure can't be
+trusting the caller to get it right.
+
 ---
 
 ## Repository layout
@@ -439,7 +460,7 @@ make oms_tests -j$(nproc)
 ./oms_tests
 ```
 
-28 test cases, ~4260 assertions. Covers the SOR merge/fill algorithm (single
+31 test cases, ~4300 assertions. Covers the SOR merge/fill algorithm (single
 and multi-exchange, partial fills, limit price clipping, BUY/SELL sign
 handling, mismatched lot sizes across exchanges), `calculate_maker_placement`
 (bid/ask side selection, fee-adjusted venue ranking, limit price, no-touch
