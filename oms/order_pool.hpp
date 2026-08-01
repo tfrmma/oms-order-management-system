@@ -40,6 +40,14 @@ struct alignas(kCacheLine) ParentOrder {
     // value, it's "how you started", not "how you're currently routing".
     sor::OrderType order_type;
 
+    // true if the ORIGINAL signal asked for reduce_only, or the instrument
+    // was under InstrumentPosition::unwind_only at signal time. reroute_leaves
+    // reads this to decide whether to re-clamp leaves_qty_lots against the
+    // CURRENT position before sweeping, the position may have moved since the
+    // original clamp if another parent on the same instrument filled in
+    // between, see the README's design decisions.
+    bool        reduce_only;
+
     qty_t       total_qty_lots;
     qty_t       cum_qty_lots;
     qty_t       leaves_qty_lots;
@@ -55,7 +63,7 @@ struct alignas(kCacheLine) ParentOrder {
     static constexpr uint8_t kMaxChildrenPerParent = 16;
     child_id_t  children[kMaxChildrenPerParent];
     uint16_t    child_mask;
-    uint8_t     _pad[5];
+    uint8_t     _pad[4];
 
     void reset() noexcept {
         std::memset(this, 0, sizeof(*this));
