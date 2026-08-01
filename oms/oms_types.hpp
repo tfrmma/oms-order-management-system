@@ -70,6 +70,16 @@ enum class ExecType : uint8_t {
 // and reroute_leaves. explicit default here on purpose: sor::OrderType::MAKER
 // is enum value 0, a bare StrategyOrderSignal{} would silently default to
 // MAKER without this, breaking every existing caller that doesn't set it.
+//
+// reduce_only: the OMS will never let this order increase the absolute size
+// of the current position or flip its sign. wrong-direction or already-flat
+// gets rejected outright (RejectReason::REDUCE_ONLY_VIOLATION), same-direction
+// oversized gets silently clamped down to exactly what closes the position,
+// see PreTradeRiskEngine::clamp_reduce_only. this is also forced on, whether
+// or not this flag is set, whenever InstrumentPosition::unwind_only is set
+// for this instrument, an ops-controlled kill switch that doesn't trust any
+// individual strategy signal to get this right on its own, see
+// ExecutionCore::set_unwind_mode.
 struct alignas(kCacheLine) StrategyOrderSignal {
     double         limit_price_usd;  // 0.0 = no limit
     qty_t          qty_lots;         // canonical unit: InstrumentTable::lot_size(instr_id)
@@ -77,7 +87,8 @@ struct alignas(kCacheLine) StrategyOrderSignal {
     sor::OrderDir  dir;
     uint8_t        strategy_id;
     sor::OrderType order_type{sor::OrderType::TAKER};
-    uint8_t        _pad[4];
+    bool           reduce_only{false};
+    uint8_t        _pad[3];
     uint64_t       signal_ns;
     double         short_vol_factor;
     double         book_imbalance;
@@ -108,6 +119,7 @@ enum class RejectReason : uint8_t {
     PARENT_POOL_EXHAUSTED = 5,
     CHILD_POOL_EXHAUSTED  = 6, // zero children made it out, not a partial dispatch
     NO_LIQUIDITY          = 7, // SOR found nothing routable, first dispatch or reroute
+    REDUCE_ONLY_VIOLATION = 8, // wrong direction (would grow/flip the position) or already flat
 };
 
 // pushed to ExecutionCore::reject_queue, one per dead signal. strategy_id and
