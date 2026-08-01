@@ -52,6 +52,37 @@ public:
     void update_limits(const RiskLimits& l) noexcept { limits_ = l; }
     void update_instruments(const InstrumentTable& t) noexcept { instruments_ = t; }
 
+    // returns the qty_lots that's actually safe to route for this signal:
+    // unchanged if reduce-only doesn't apply, clamped down to exactly what
+    // closes the position if it does and the direction is right, 0 if the
+    // direction is wrong or there's nothing to reduce (caller should treat 0
+    // as RejectReason::REDUCE_ONLY_VIOLATION, not "route zero lots").
+    //
+    // reduce-only is in effect if sig.reduce_only is set OR
+    // InstrumentPosition::unwind_only is set for this instrument, whichever
+    // the signal says is never the only thing that can turn this on, an
+    // ops-forced unwind can't be skipped by a strategy that forgot the flag.
+    [[nodiscard]] __attribute__((always_inline))
+    qty_t clamp_reduce_only(const StrategyOrderSignal& sig) const noexcept {
+        if (sig.instr_id >= kMaxInstruments) [[unlikely]] return sig.qty_lots;
+        return clamp_reduce_only_impl(sig.instr_id, sig.dir, sig.qty_lots, sig.reduce_only);
+    }
+
+    // same clamp, called from reroute_leaves against a parent's CURRENT
+    // leaves_qty_lots. the position may have moved since the original clamp
+    // if another parent on the same instrument filled in between, always
+    // re-reads net_qty_lots live rather than trusting whatever was true when
+    // the parent was first created. pass parent.reduce_only for
+    // reduce_only_requested: once a parent is constrained, for any reason, it
+    // stays constrained for its whole lifecycle even if the live kill switch
+    // is toggled off in the meantime, see the README's design decisions.
+    [[nodiscard]] __attribute__((always_inline))
+    qty_t clamp_reduce_only(instr_id_t instr_id, sor::OrderDir dir,
+                            qty_t qty_lots, bool reduce_only_requested) const noexcept {
+        if (instr_id >= kMaxInstruments) [[unlikely]] return qty_lots;
+        return clamp_reduce_only_impl(instr_id, dir, qty_lots, reduce_only_requested);
+    }
+
 private:
     [[nodiscard]] __attribute__((always_inline))
     RiskRejectReason check_fat_finger(const StrategyOrderSignal& sig) const noexcept {
@@ -89,6 +120,39 @@ private:
         return (pos_.margin.available() < limits_.min_margin_required)
             ? RiskRejectReason::MARGIN
             : RiskRejectReason::OK;
+    }
+
+    [[nodiscard]] __attribute__((always_inline))
+    qty_t clamp_reduce_only_impl(instr_id_t instr_id, sor::OrderDir dir,
+                                 qty_t qty_lots, bool reduce_only_requested) const noexcept {
+        const bool forced = pos_.instruments[instr_id].unwind_only.load(std::memory_order_acquire);
+        if (!reduce_only_requested && !forced) return qty_lots;
+
+        const int64_t net = pos_.instruments[instr_id].net_qty_lots
+                                .load(std::memory_order_acquire);
+        // BUY reduces a short (net < 0), SELL reduces a long (net > 0).
+        // wrong direction or already flat: this order can't legitimately
+        // reduce anything.
+        const bool reduces_something =
+            (dir == sor::OrderDir::BUY  && net < 0) ||
+            (dir == sor::OrderDir::SELL && net > 0);
+        if (!reduces_something) return 0;
+
+        // headroom has to account for exposure OTHER outstanding orders on
+        // this instrument already committed (open_buy_lots/open_sell_lots),
+        // not just the confirmed position. two reduce-only orders submitted
+        // before either fills would otherwise both clamp against the SAME
+        // net_qty_lots independently and could together overshoot flat and
+        // flip the position, exactly what reduce-only exists to prevent.
+        const int64_t already_committed = (dir == sor::OrderDir::BUY)
+            ? pos_.instruments[instr_id].open_buy_lots.load(std::memory_order_acquire)
+            : pos_.instruments[instr_id].open_sell_lots.load(std::memory_order_acquire);
+
+        const int64_t abs_net  = (net < 0) ? -net : net;
+        const int64_t headroom = abs_net - already_committed;
+        if (headroom <= 0) return 0;
+
+        return (qty_lots < headroom) ? qty_lots : static_cast<qty_t>(headroom);
     }
 
     RiskLimits              limits_;
