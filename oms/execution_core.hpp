@@ -54,6 +54,14 @@ public:
     void on_strategy_order(const StrategyOrderSignal& sig)  noexcept;
     void on_execution_report(const ExecutionReport& report) noexcept;
 
+    // ops-controlled kill switch, safe from any thread (single atomic store).
+    // forces reduce-only for this instrument regardless of what any signal's
+    // own reduce_only flag says, see PreTradeRiskEngine::clamp_reduce_only.
+    void set_unwind_mode(instr_id_t instr_id, bool enabled) noexcept {
+        if (instr_id < kMaxInstruments)
+            pos_.instruments[instr_id].unwind_only.store(enabled, std::memory_order_release);
+    }
+
     InboundQueue<StrategyOrderSignal>  strategy_queue;
     InboundQueue<ExecutionReport>      exec_report_queue;
     OutboundQueue<OrderReject>         reject_queue;  // strategy thread drains this
