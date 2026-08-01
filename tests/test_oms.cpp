@@ -518,6 +518,83 @@ TEST_CASE("PreTradeRiskEngine: rejects and passes for the right reasons") {
     }
 }
 
+TEST_CASE("PreTradeRiskEngine: clamp_reduce_only") {
+    PositionTable pos{};
+    RiskLimits limits{};
+    InstrumentTable instruments{};
+    PreTradeRiskEngine risk(limits, instruments, pos);
+
+    SECTION("not reduce-only, no unwind: passes through unchanged") {
+        pos.instruments[0].net_qty_lots.store(5);
+        StrategyOrderSignal sig{};
+        sig.instr_id = 0;
+        sig.dir      = OrderDir::BUY;
+        sig.qty_lots = 100;  // would grow the long position, fine, not reduce-only
+        REQUIRE(risk.clamp_reduce_only(sig) == 100);
+    }
+
+    SECTION("wrong direction: long position, BUY reduce-only rejected (0)") {
+        pos.instruments[0].net_qty_lots.store(5);  // long 5
+        StrategyOrderSignal sig{};
+        sig.instr_id     = 0;
+        sig.dir          = OrderDir::BUY;  // would grow the long, not reduce it
+        sig.qty_lots     = 3;
+        sig.reduce_only  = true;
+        REQUIRE(risk.clamp_reduce_only(sig) == 0);
+    }
+
+    SECTION("flat position: any reduce-only rejected (0)") {
+        pos.instruments[0].net_qty_lots.store(0);
+        StrategyOrderSignal sig{};
+        sig.instr_id    = 0;
+        sig.dir         = OrderDir::SELL;
+        sig.qty_lots    = 1;
+        sig.reduce_only = true;
+        REQUIRE(risk.clamp_reduce_only(sig) == 0);
+    }
+
+    SECTION("right direction, oversized: clamped to exactly what closes the position") {
+        pos.instruments[0].net_qty_lots.store(-32);  // short 32
+        StrategyOrderSignal sig{};
+        sig.instr_id    = 0;
+        sig.dir         = OrderDir::BUY;   // BUY reduces a short
+        sig.qty_lots    = 50;              // asking for more than the position has
+        sig.reduce_only = true;
+        REQUIRE(risk.clamp_reduce_only(sig) == 32);
+    }
+
+    SECTION("right direction, undersized: passes through unchanged") {
+        pos.instruments[0].net_qty_lots.store(-32);
+        StrategyOrderSignal sig{};
+        sig.instr_id    = 0;
+        sig.dir         = OrderDir::BUY;
+        sig.qty_lots    = 10;  // well within the 32 headroom
+        sig.reduce_only = true;
+        REQUIRE(risk.clamp_reduce_only(sig) == 10);
+    }
+
+    SECTION("SELL reduces a long, same clamp logic mirrored") {
+        pos.instruments[0].net_qty_lots.store(7);  // long 7
+        StrategyOrderSignal sig{};
+        sig.instr_id    = 0;
+        sig.dir         = OrderDir::SELL;
+        sig.qty_lots    = 20;
+        sig.reduce_only = true;
+        REQUIRE(risk.clamp_reduce_only(sig) == 7);
+    }
+
+    SECTION("forced by unwind_only even without the signal's own flag set") {
+        pos.instruments[0].net_qty_lots.store(-32);
+        pos.instruments[0].unwind_only.store(true);  // ops kill switch, not the strategy's doing
+        StrategyOrderSignal sig{};
+        sig.instr_id    = 0;
+        sig.dir         = OrderDir::BUY;
+        sig.qty_lots    = 50;
+        sig.reduce_only = false;  // strategy didn't ask for this, kill switch overrides anyway
+        REQUIRE(risk.clamp_reduce_only(sig) == 32);
+    }
+}
+
 TEST_CASE("SpscQueue: FIFO order and one-slot-reserved capacity") {
     SpscQueue<int, 4> q;  // usable capacity is N-1: the ring reserves a slot to tell full from empty
     REQUIRE(q.empty());
@@ -942,4 +1019,276 @@ TEST_CASE("ExecutionCore: maker order that fills before the timeout never sweeps
     core->tick(real_now_ns() + cfg.maker_timeout_ns + 1'000'000ULL);
     REQUIRE(core->pool().parents_in_use()  == 0);
     REQUIRE(core->pool().children_in_use() == 0);
+}
+
+TEST_CASE("ExecutionCore: reduce_only clamps or rejects based on current position") {
+    SECTION("oversized reduce-only gets clamped to exactly what closes the position") {
+        ExchangeState ex{};
+        init_exchange(ex, 0);
+        set_levels(ex.book.bids(), {{100, 100}});
+        set_levels(ex.book.asks(), {{101, 100}});
+
+        ExecCoreConfig cfg{};
+        cfg.exchange_states  = &ex;
+        cfg.active_exchanges = 1;
+        cfg.risk_limits.max_order_lots[0]  = 1000;
+        cfg.risk_limits.max_net_lots[0]    = 1000;
+        cfg.instruments.instruments[0].lot_size = 1.0;
+        cfg.margin.equity_usd              = 1e9;
+        cfg.notional_gate.auto_approve_usd = 1e12;
+        cfg.dashboard.enabled              = false;
+
+        auto core = std::make_unique<ExecutionCore>(cfg);
+
+        // establish a short position of 10 via a normal SELL + fill
+        StrategyOrderSignal open{};
+        open.instr_id = 0;
+        open.dir      = OrderDir::SELL;
+        open.qty_lots = 10;
+        core->on_strategy_order(open);
+
+        ExecutionReport fill{};
+        fill.child_id         = 0;
+        fill.exec_type        = ExecType::FILL;
+        fill.exchange_id      = 0;
+        fill.fill_qty_lots    = 10;
+        fill.fill_price_ticks = 100;
+        fill.recv_ns           = 1;
+        core->on_execution_report(fill);
+
+        REQUIRE(core->positions().instruments[0].net_qty_lots.load() == -10);
+        REQUIRE(core->pool().parents_in_use() == 0);  // fully filled, freed
+
+        // LIFO: parent 0 and child 0 just got freed, this reuses those ids
+        StrategyOrderSignal reduce{};
+        reduce.instr_id    = 0;
+        reduce.dir         = OrderDir::BUY;
+        reduce.qty_lots    = 25;  // more than the 10 short
+        reduce.reduce_only = true;
+        core->on_strategy_order(reduce);
+
+        REQUIRE(core->pool().parents_in_use()   == 1);
+        REQUIRE(core->pool().parent(0).total_qty_lots  == 10);  // clamped, not 25
+        REQUIRE(core->pool().parent(0).leaves_qty_lots == 10);
+        REQUIRE(core->pool().parent(0).reduce_only);
+        REQUIRE(core->pool().child(0).qty_lots == 10);
+    }
+
+    SECTION("wrong-direction reduce-only is rejected, not silently ignored") {
+        ExchangeState ex{};
+        init_exchange(ex, 0);
+        set_levels(ex.book.bids(), {{100, 100}});
+        set_levels(ex.book.asks(), {{101, 100}});
+
+        ExecCoreConfig cfg{};
+        cfg.exchange_states  = &ex;
+        cfg.active_exchanges = 1;
+        cfg.risk_limits.max_order_lots[0]  = 1000;
+        cfg.risk_limits.max_net_lots[0]    = 1000;
+        cfg.instruments.instruments[0].lot_size = 1.0;
+        cfg.margin.equity_usd              = 1e9;
+        cfg.notional_gate.auto_approve_usd = 1e12;
+        cfg.dashboard.enabled              = false;
+
+        auto core = std::make_unique<ExecutionCore>(cfg);
+
+        StrategyOrderSignal open{};
+        open.instr_id = 0;
+        open.dir      = OrderDir::SELL;
+        open.qty_lots = 10;
+        core->on_strategy_order(open);
+        ExecutionReport fill{};
+        fill.child_id = 0; fill.exec_type = ExecType::FILL; fill.exchange_id = 0;
+        fill.fill_qty_lots = 10; fill.fill_price_ticks = 100; fill.recv_ns = 1;
+        core->on_execution_report(fill);
+        REQUIRE(core->positions().instruments[0].net_qty_lots.load() == -10);  // short
+
+        // SELL reduce-only while already short would grow the short, wrong direction
+        StrategyOrderSignal bad{};
+        bad.instr_id    = 0;
+        bad.dir         = OrderDir::SELL;
+        bad.qty_lots    = 5;
+        bad.reduce_only = true;
+        core->on_strategy_order(bad);
+
+        REQUIRE(core->pool().parents_in_use() == 0);  // rejected, no parent created
+        OrderReject rej{};
+        REQUIRE(core->reject_queue.pop(rej));
+        REQUIRE(rej.reason == RejectReason::REDUCE_ONLY_VIOLATION);
+    }
+
+    SECTION("reduce-only on a flat position is rejected") {
+        ExchangeState ex{};
+        init_exchange(ex, 0);
+        set_levels(ex.book.bids(), {{100, 100}});
+        set_levels(ex.book.asks(), {{101, 100}});
+
+        ExecCoreConfig cfg{};
+        cfg.exchange_states  = &ex;
+        cfg.active_exchanges = 1;
+        cfg.instruments.instruments[0].lot_size = 1.0;
+        cfg.margin.equity_usd              = 1e9;
+        cfg.notional_gate.auto_approve_usd = 1e12;
+        cfg.dashboard.enabled              = false;
+
+        auto core = std::make_unique<ExecutionCore>(cfg);
+        REQUIRE(core->positions().instruments[0].net_qty_lots.load() == 0);
+
+        StrategyOrderSignal sig{};
+        sig.instr_id    = 0;
+        sig.dir         = OrderDir::BUY;
+        sig.qty_lots    = 5;
+        sig.reduce_only = true;
+        core->on_strategy_order(sig);
+
+        REQUIRE(core->pool().parents_in_use() == 0);
+        OrderReject rej{};
+        REQUIRE(core->reject_queue.pop(rej));
+        REQUIRE(rej.reason == RejectReason::REDUCE_ONLY_VIOLATION);
+    }
+
+    SECTION("set_unwind_mode forces the clamp even when the signal doesn't ask for it") {
+        ExchangeState ex{};
+        init_exchange(ex, 0);
+        set_levels(ex.book.bids(), {{100, 100}});
+        set_levels(ex.book.asks(), {{101, 100}});
+
+        ExecCoreConfig cfg{};
+        cfg.exchange_states  = &ex;
+        cfg.active_exchanges = 1;
+        cfg.risk_limits.max_order_lots[0]  = 1000;
+        cfg.risk_limits.max_net_lots[0]    = 1000;
+        cfg.instruments.instruments[0].lot_size = 1.0;
+        cfg.margin.equity_usd              = 1e9;
+        cfg.notional_gate.auto_approve_usd = 1e12;
+        cfg.dashboard.enabled              = false;
+
+        auto core = std::make_unique<ExecutionCore>(cfg);
+
+        StrategyOrderSignal open{};
+        open.instr_id = 0;
+        open.dir      = OrderDir::SELL;
+        open.qty_lots = 10;
+        core->on_strategy_order(open);
+        ExecutionReport fill{};
+        fill.child_id = 0; fill.exec_type = ExecType::FILL; fill.exchange_id = 0;
+        fill.fill_qty_lots = 10; fill.fill_price_ticks = 100; fill.recv_ns = 1;
+        core->on_execution_report(fill);
+        REQUIRE(core->positions().instruments[0].net_qty_lots.load() == -10);
+
+        core->set_unwind_mode(0, true);  // ops kill switch, not the strategy's doing
+
+        StrategyOrderSignal sig{};
+        sig.instr_id    = 0;
+        sig.dir         = OrderDir::BUY;
+        sig.qty_lots    = 999;       // strategy asking for way more than the position
+        sig.reduce_only = false;     // and NOT setting the flag itself
+        core->on_strategy_order(sig);
+
+        REQUIRE(core->pool().parents_in_use() == 1);
+        REQUIRE(core->pool().parent(0).total_qty_lots == 10);  // clamped anyway
+        REQUIRE(core->pool().parent(0).reduce_only);
+    }
+}
+
+TEST_CASE("ExecutionCore: reroute_leaves re-clamps reduce_only against in-flight reservations") {
+    // 20 ask levels, 1 lot each: enough for a 20-lot BUY to need every level,
+    // but ParentOrder::kMaxChildrenPerParent (16) caps the first dispatch,
+    // leaving a real, deterministic 4-lot gap that reroute_leaves has to
+    // pick up later. that's the exact moment the re-clamp has to fire.
+    ExchangeState ex{};
+    init_exchange(ex, 0);
+    set_levels(ex.book.bids(), {{100, 1000}});
+    LevelSide& asks = ex.book.asks();
+    for (uint32_t i = 0; i < 20; ++i) {
+        asks.price_ticks[i] = 200 + static_cast<int64_t>(i);
+        asks.qty_lots[i]    = 1;
+    }
+    asks.count = 20;
+    asks.recompute_cumulative();
+
+    ExecCoreConfig cfg{};
+    cfg.exchange_states  = &ex;
+    cfg.active_exchanges = 1;
+    cfg.risk_limits.max_order_lots[0]  = 1000;
+    cfg.risk_limits.max_net_lots[0]    = 1000;
+    cfg.instruments.instruments[0].lot_size = 1.0;
+    cfg.margin.equity_usd              = 1e9;
+    cfg.notional_gate.auto_approve_usd = 1e12;
+    cfg.dashboard.enabled              = false;
+
+    auto core = std::make_unique<ExecutionCore>(cfg);
+
+    // short 20 via a SELL against the deep bid
+    StrategyOrderSignal open{};
+    open.instr_id = 0;
+    open.dir      = OrderDir::SELL;
+    open.qty_lots = 20;
+    core->on_strategy_order(open);
+    ExecutionReport open_fill{};
+    open_fill.child_id = 0; open_fill.exec_type = ExecType::FILL; open_fill.exchange_id = 0;
+    open_fill.fill_qty_lots = 20; open_fill.fill_price_ticks = 100; open_fill.recv_ns = 1;
+    core->on_execution_report(open_fill);
+    REQUIRE(core->positions().instruments[0].net_qty_lots.load() == -20);
+    REQUIRE(core->pool().parents_in_use() == 0);  // opening order fully filled, freed
+
+    // parent A (id 0, LIFO reuse): reduce-only BUY for the FULL 20. clamp at
+    // signal time sees net=-20, open_buy_lots=0 (nothing else outstanding
+    // yet) -> headroom 20, unclamped. dispatch caps at 16 children though,
+    // DISPATCH_GAP releases margin for the undispatched 4, leaving
+    // open_buy_lots at 16 and parent A's leaves_qty_lots at 4.
+    StrategyOrderSignal a{};
+    a.instr_id    = 0;
+    a.dir         = OrderDir::BUY;
+    a.qty_lots    = 20;
+    a.reduce_only = true;
+    core->on_strategy_order(a);
+    REQUIRE(core->pool().parent(0).total_qty_lots  == 20);
+    // leaves_qty_lots = total - cum, still 20 here: nothing has FILLED yet,
+    // dispatch alone doesn't touch it. the 4-lot gap from the
+    // kMaxChildrenPerParent cap only becomes visible once the 16 dispatched
+    // children actually fill and cum_qty_lots catches up.
+    REQUIRE(core->pool().parent(0).leaves_qty_lots == 20);
+    REQUIRE(core->pool().children_in_use() == 16);
+
+    // parent B (id 1): a SEPARATE reduce-only BUY for 4, submitted before A
+    // fills anything. clamp sees net=-20 (still, A hasn't filled), but
+    // open_buy_lots is now 16 (A's dispatched exposure) -> headroom is only
+    // 20-16=4, so B's own 4-lot request passes through unclamped, using up
+    // the LAST of the shared headroom. this is the part that would silently
+    // overshoot without accounting for open_buy_lots: without it, B would
+    // ALSO see a naive 20 lots of headroom.
+    StrategyOrderSignal b{};
+    b.instr_id    = 0;
+    b.dir         = OrderDir::BUY;
+    b.qty_lots    = 4;
+    b.reduce_only = true;
+    core->on_strategy_order(b);
+    REQUIRE(core->pool().parent(1).total_qty_lots == 4);
+    REQUIRE(core->pool().parents_in_use()  == 2);
+    REQUIRE(core->pool().children_in_use() == 20);  // A's 16 + B's 4
+
+    // fill all 16 of A's children. the LAST fill flips A's leaves_qty_lots
+    // (4) to a reroute attempt, exactly when the re-clamp has to run.
+    for (child_id_t cid = 0; cid < 16; ++cid) {
+        ExecutionReport rep{};
+        rep.child_id = cid; rep.exec_type = ExecType::FILL; rep.exchange_id = 0;
+        rep.fill_qty_lots = 1;
+        rep.fill_price_ticks = 200 + static_cast<price_t>(cid);
+        rep.recv_ns = 1;
+        core->on_execution_report(rep);
+    }
+    REQUIRE(core->positions().instruments[0].net_qty_lots.load() == -4);
+
+    // without the fix: A's stale leaves_qty_lots (4) would get re-dispatched
+    // as-is, on top of B's ALREADY-reserved 4, trying to commit 8 lots of BUY
+    // exposure against only 4 lots of remaining short. with the fix: A's
+    // reroute re-clamps against net=-4 minus B's still-outstanding
+    // open_buy_lots=4, finds zero headroom left, and closes out instead of
+    // dispatching anything new.
+    REQUIRE(core->pool().parent(0).state == OrderState::FILLED);
+    // parent B is untouched by any of this, its own 4 children are still
+    // exactly what it originally dispatched
+    REQUIRE(core->pool().parent(1).leaves_qty_lots == 4);
+    REQUIRE(core->pool().children_in_use() == 4);  // only B's 4 children remain live
 }
