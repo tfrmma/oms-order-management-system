@@ -15,6 +15,15 @@ struct alignas(kCacheLine) InstrumentPosition {
     std::atomic<int64_t>  open_sell_lots{0};
     std::atomic<double>   avg_entry_price{0.0};
 
+    // ops-controlled kill switch, independent of what any given
+    // StrategyOrderSignal says. when set, PreTradeRiskEngine::clamp_reduce_only
+    // forces reduce-only behavior for this instrument regardless of
+    // sig.reduce_only, a strategy bug that forgets the flag during an active
+    // unwind still can't grow the position. set via
+    // ExecutionCore::set_unwind_mode, safe to call from any thread, it's a
+    // single atomic store, no lock, no queue hop needed to take effect.
+    std::atomic<bool>     unwind_only{false};
+
     void apply_fill(sor::OrderDir dir, qty_t lots, double price) noexcept {
         const int64_t signed_lots = (dir == sor::OrderDir::BUY)
             ? static_cast<int64_t>(lots) : -static_cast<int64_t>(lots);
