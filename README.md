@@ -199,6 +199,28 @@ changes to do the sweep correctly. `calculate_maker_placement` never splits
 across venues on purpose: posting the same size on multiple books at once
 risks a double fill with no coordination between them, out of scope for v1.
 
+**`algos/` is a client of the OMS, not a layer inside it.** `TwapScheduler`
+lives in `namespace algos`, not `namespace oms`, on purpose, it pulls in
+just the three `oms::` types it actually needs (`instr_id_t`, `qty_t`,
+`StrategyOrderSignal`) with explicit `using` declarations, same pattern
+`oms_types.hpp` already uses for the `sor::` types it depends on. Putting it
+in `oms::` would say "this is part of OMS internals" and it isn't, it
+cuts `total_qty_lots` into slices over `duration_ns` and pushes a
+`StrategyOrderSignal` per slice onto `strategy_queue`, the same queue any
+hand-built signal goes through. It doesn't include `execution_core.hpp`,
+doesn't touch `pool_`/`pos_`/`timer_wheel_`, has no idea `ExecutionCore`
+exists. That's deliberate: from `ExecutionCore`'s side, a TWAP slice and a
+one-off market order are indistinguishable, which means TWAP needed zero
+changes to `dispatch_child_orders`, `reroute_leaves`, or anything else in
+the pipeline. Both slice size and inter-slice interval are jittered
+(`size_jitter_frac`/`interval_jitter_frac`, ±30% by default) around the
+nominal TWAP values, symmetric around 1.0 so the time-weighted average stays
+correct over the full run. A fixed clip size at a fixed interval is a
+detectable pattern, not an execution algo, jitter is what actually makes it
+one. The last slice never gets jittered, it takes whatever `remaining_lots_`
+is left, which is also what keeps `sum(slices) == total_qty_lots` exact
+instead of drifting off by a lot or two from repeated rounding.
+
 **The timer wheel's clock has to be primed before its first real tick, or
 it doesn't come back.** `TimerWheel::now_ns_` defaults to 0. `tick(now)`
 catches up to `now` by walking forward `tick_ns_` (1ms) at a time, which is
@@ -278,6 +300,9 @@ oms-order-management-system/
 │   ├── logger.hpp            # AsyncLogger, lock-free ring + drain thread
 │   ├── dashboard.hpp         # Dashboard, live terminal snapshot thread
 │   └── execution_core.hpp/cpp # ExecutionCore, ties all of the above together
+│
+├── algos/                    # execution algos, external clients of the OMS
+│   └── twap_scheduler.hpp    # TwapScheduler, randomized-size/interval TWAP
 │
 ├── tests/
 │   ├── test_oms.cpp          # Catch2 suite, SOR + OMS component + integration tests
@@ -531,6 +556,26 @@ StrategyOrderSignal maker_sig = sig;
 maker_sig.order_type = OrderType::MAKER;
 core->strategy_queue.push(maker_sig);
 
+// TWAP: 5 BTC over 10 minutes, 20 slices, jittered size and interval.
+// lives in algos::, not oms:: — it's a client of ExecutionCore, not part
+// of it, see "algos/ is a client of the OMS" above. runs on whatever
+// thread owns the strategy layer, not the execution thread.
+using namespace algos;
+TwapConfig twap_cfg{};
+twap_cfg.instr_id     = BTC_PERP;
+twap_cfg.dir          = OrderDir::BUY;
+twap_cfg.total_qty_lots = to_lots(5.0, 0.001);
+twap_cfg.duration_ns  = 600'000'000'000ULL;
+twap_cfg.num_slices   = 20;
+TwapScheduler twap(twap_cfg);
+twap.start(now_ns());
+
+// call this on your own polling cadence, a few times a second is plenty
+while (!twap.done()) {
+    StrategyOrderSignal slice{};
+    if (twap.tick(now_ns(), slice)) core->strategy_queue.push(slice);
+}
+
 // gateway threads push fills. fill_qty_lots is in THIS exchange's native
 // lot size, ExecutionCore converts it internally, don't pre-convert it.
 ExecutionReport rep{};
@@ -647,6 +692,12 @@ without any special-casing in the comparison.
   and `OMS_SOURCES` are now CMake list variables defined once, every target
   that needs its own recompile references the same list instead of
   maintaining a separate copy that can drift.
+
+- **Open:** `algos/twap_scheduler.hpp` has no Catch2 coverage yet. Verified
+  manually (ASan/UBSan clean, `sum(slices) == total_qty_lots` exact across
+  repeated seeded runs, no zero-lot or negative slices), but it hasn't been
+  through the same integration-test treatment as the maker-then-taker-sweep
+  path. Add it to `tests/test_oms.cpp` before this sees a real order.
 
 ---
 
