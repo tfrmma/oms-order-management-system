@@ -485,13 +485,15 @@ make oms_tests -j$(nproc)
 ./oms_tests
 ```
 
-31 test cases, ~4300 assertions. Covers the SOR merge/fill algorithm (single
+43 test cases, ~5100 assertions, split across `tests/test_oms.cpp` (SOR and
+OMS core) and `tests/test_twap.cpp` (`algos/twap_scheduler.hpp`, its own file
+since `algos/` is its own layer). Covers the SOR merge/fill algorithm (single
 and multi-exchange, partial fills, limit price clipping, BUY/SELL sign
 handling, mismatched lot sizes across exchanges), `calculate_maker_placement`
 (bid/ask side selection, fee-adjusted venue ranking, limit price, no-touch
 failure, `spread_capture_bps`), `OMSOrderPool` alloc/free and failure
 counting, `InstrumentPosition` avg price tracking, `PreTradeRiskEngine`
-rejection paths, `SpscQueue`, `TimerWheel`, and several `ExecutionCore`
+rejection paths, `SpscQueue`, `TimerWheel`, several `ExecutionCore`
 integration tests that drive a real, heap-allocated `ExecutionCore` through
 its public API (`on_strategy_order`/`on_execution_report`/`tick`, not a
 mock): the dispatch-gap margin/reroute fix, cross-exchange fill accounting
@@ -499,7 +501,11 @@ through `InstrumentTable`, `reject_queue` delivering the right `RejectReason`,
 and the full maker-then-taker-sweep hybrid end to end, `tick()` driven with
 real `CLOCK_REALTIME`-scale timestamps rather than small fixed numbers,
 `ExecutionCore`'s internal `now_ns()` is real wall-clock time and the timer
-wheel only behaves correctly relative to that same clock.
+wheel only behaves correctly relative to that same clock. Plus `TwapScheduler`:
+exact-sum-under-jitter across 20 seeds, first-slice-fires-immediately,
+`num_slices` exceeding `total_qty_lots` (the negative-`qty_lots` regression,
+see [Known limitations](#known-limitations--todo)), and the `num_slices=0`
+divide-by-zero guard.
 
 Every `ExecutionCore` in the test suite is heap-allocated
 (`std::make_unique`), never a stack local, `sizeof(ExecutionCore)` is large
@@ -693,11 +699,20 @@ without any special-casing in the comparison.
   that needs its own recompile references the same list instead of
   maintaining a separate copy that can drift.
 
-- **Open:** `algos/twap_scheduler.hpp` has no Catch2 coverage yet. Verified
-  manually (ASan/UBSan clean, `sum(slices) == total_qty_lots` exact across
-  repeated seeded runs, no zero-lot or negative slices), but it hasn't been
-  through the same integration-test treatment as the maker-then-taker-sweep
-  path. Add it to `tests/test_oms.cpp` before this sees a real order.
+- **Fixed:** `algos/twap_scheduler.hpp` had no Catch2 coverage, and writing it
+  surfaced a real bug: request more slices than `total_qty_lots` (say, 10
+  slices for a 3-lot order) and `min_reserve` in `make_slice_signal` could
+  exceed `remaining_lots_`, handing `std::clamp` a `lo > hi` range. It didn't
+  crash, it just silently returned a negative `qty_lots` straight into what
+  would've been a live `StrategyOrderSignal`. Fixed by capping the effective
+  slice count to `total_qty_lots` at construction, `TwapScheduler` can't hand
+  out more slices than it has lots to put in them. Also fixed the timing side
+  of the same bug: the interval math was still dividing by the originally
+  requested slice count, not the capped one, so a capped run front-loaded
+  into the first fraction of `duration_ns` instead of spreading across all of
+  it. 12 test cases now in `tests/test_twap.cpp`, covering exact-sum-under-
+  jitter across 20 seeds, the zero/negative-qty regression above, first-slice-
+  fires-immediately, and the num_slices=0 divide-by-zero guard.
 
 ---
 
