@@ -40,13 +40,22 @@ struct TwapConfig {
 // not thread-safe. drive it from whatever thread owns the strategy layer,
 // call tick() on your own cadence and push the signal onto strategy_queue
 // when it fires.
+// caps requested slice count to what's actually sliceable: can't hand out
+// more slices than lots, each one needs at least 1. total_lots <= 0 returns
+// 1, doesn't matter, done() short-circuits on remaining_lots_ <= 0 anyway.
+[[nodiscard]] inline uint32_t clamp_slice_count(uint32_t requested, qty_t total_lots) noexcept {
+    if (requested == 0 || total_lots <= 0) return 1;
+    return static_cast<uint32_t>(std::min<qty_t>(requested, total_lots));
+}
+
 class TwapScheduler {
 public:
     explicit TwapScheduler(const TwapConfig& cfg) noexcept
         : cfg_(cfg)
         , rng_(cfg.rng_seed != 0 ? cfg.rng_seed : std::random_device{}())
         , remaining_lots_(cfg.total_qty_lots)
-        , slices_remaining_(cfg.num_slices > 0 ? cfg.num_slices : 1)
+        , total_slices_(clamp_slice_count(cfg.num_slices, cfg.total_qty_lots))
+        , slices_remaining_(total_slices_)
     {}
 
     // first slice fires immediately at start_ns, no dead gap before the
@@ -77,7 +86,7 @@ private:
             slice_lots = remaining_lots_;
         } else {
             const double nominal = static_cast<double>(cfg_.total_qty_lots)
-                                  / static_cast<double>(cfg_.num_slices);
+                                  / static_cast<double>(total_slices_);
             slice_lots = static_cast<qty_t>(std::llround(nominal * jittered(cfg_.size_jitter_frac)));
 
             // min_reserve leaves 1 lot per remaining slice, otherwise a fat
@@ -107,7 +116,7 @@ private:
         if (done()) { next_deadline_ns_ = UINT64_MAX; return; }
 
         const double nominal_interval_ns =
-            static_cast<double>(cfg_.duration_ns) / static_cast<double>(cfg_.num_slices);
+            static_cast<double>(cfg_.duration_ns) / static_cast<double>(total_slices_);
         const auto interval_ns =
             static_cast<uint64_t>(nominal_interval_ns * jittered(cfg_.interval_jitter_frac));
 
@@ -124,6 +133,7 @@ private:
     std::mt19937_64 rng_;
 
     qty_t    remaining_lots_;
+    uint32_t total_slices_;
     uint32_t slices_remaining_;
     uint64_t next_deadline_ns_{0};
 
