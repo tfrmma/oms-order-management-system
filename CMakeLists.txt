@@ -86,6 +86,7 @@ target_compile_options(catch2_lib PRIVATE -O1 -fno-exceptions -fno-rtti)
 # the local CPU's ISA for no benefit, Debug's -O0 would make them slow).
 add_executable(oms_tests
     tests/test_oms.cpp
+    tests/test_twap.cpp
     ${SOR_SOURCES}
     ${OMS_SOURCES}
 )
@@ -108,6 +109,7 @@ target_link_libraries(oms_tests PRIVATE catch2_lib Threads::Threads)
 # went from 1024 to 8192), it earns its place in CI.
 add_executable(oms_tests_san
     tests/test_oms.cpp
+    tests/test_twap.cpp
     tests/catch_amalgamated.cpp
     ${SOR_SOURCES}
     ${OMS_SOURCES}
